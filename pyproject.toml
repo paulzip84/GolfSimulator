@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pga-markov-sim"
+version = "0.1.0"
+description = "Local PGA Tour simulator using DataGolf with a Markov + Monte Carlo model."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi>=0.115.0",
+  "httpx>=0.27.0",
+  "numpy>=1.26.0",
+  "pydantic>=2.8.0",
+  "pydantic-settings>=2.3.0",
+  "uvicorn>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+  "ruff>=0.6.0",
+]
+
+[project.scripts]
+pga-sim = "pga_sim.cli:main"
+pga-sim-api = "pga_sim.api:run"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["pga_sim*"]
+
+[tool.setuptools.package-data]
+pga_sim = ["web/index.html", "web/assets/*.css", "web/assets/*.js"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

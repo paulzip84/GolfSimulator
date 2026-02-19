@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PGA Markov Simulator</title>
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+    />
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <div class="bg-orb orb-a" aria-hidden="true"></div>
+    <div class="bg-orb orb-b" aria-hidden="true"></div>
+    <div class="bg-grid" aria-hidden="true"></div>
+
+    <main class="layout">
+      <header class="hero card">
+        <p class="eyebrow">Local macOS app</p>
+        <h1>PGA Tour Markov + Stochastic Simulator</h1>
+        <p class="subhead">
+          Load an event from DataGolf, run high-volume simulations, and inspect player-by-player
+          probabilities for winner, top 3, top 5, and top 10.
+        </p>
+      </header>
+
+      <section class="card controls" aria-label="Simulation controls">
+        <div class="field-grid">
+          <label class="field">
+            <span>Tour</span>
+            <select id="tourSelect">
+              <option value="pga" selected>PGA</option>
+              <option value="euro">DP World Tour</option>
+              <option value="kft">Korn Ferry Tour</option>
+              <option value="liv">LIV</option>
+            </select>
+          </label>
+
+          <label class="field field-wide">
+            <span>Event</span>
+            <select id="eventSelect">
+              <option value="">Auto (use latest available event)</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Simulations</span>
+            <input id="simulationsInput" type="number" min="500" max="250000" step="500" value="10000" />
+          </label>
+
+          <label class="field">
+            <span>Cut Size</span>
+            <input id="cutSizeInput" type="number" min="20" max="156" value="70" />
+          </label>
+
+          <label class="field">
+            <span>Mean Reversion</span>
+            <input id="meanReversionInput" type="range" min="0" max="0.4" step="0.01" value="0.1" />
+            <output id="meanReversionValue">0.10</output>
+          </label>
+
+          <label class="field">
+            <span>Use Seasonal Form Blend</span>
+            <select id="useSeasonalFormSelect">
+              <option value="yes" selected>Yes</option>
+              <option value="no">No</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Baseline Season</span>
+            <input id="baselineSeasonInput" type="number" min="1990" max="2100" value="2025" />
+          </label>
+
+          <label class="field">
+            <span>Current Season</span>
+            <input id="currentSeasonInput" type="number" min="1990" max="2100" value="2026" />
+          </label>
+
+          <label class="field">
+            <span>Seasonal Blend Weight</span>
+            <input id="seasonalWeightInput" type="range" min="0" max="1" step="0.01" value="0.35" />
+            <output id="seasonalWeightValue">0.35</output>
+          </label>
+
+          <label class="field">
+            <span>Current Season Weight</span>
+            <input id="currentSeasonWeightInput" type="range" min="0" max="1" step="0.01" value="0.6" />
+            <output id="currentSeasonWeightValue">0.60</output>
+          </label>
+
+          <label class="field">
+            <span>Form Delta Weight</span>
+            <input id="formDeltaWeightInput" type="range" min="0" max="1" step="0.01" value="0.25" />
+            <output id="formDeltaWeightValue">0.25</output>
+          </label>
+
+          <label class="field">
+            <span>Seed (optional)</span>
+            <input id="seedInput" type="number" min="0" placeholder="Random if blank" />
+          </label>
+
+          <label class="field">
+            <span>Rows to Show</span>
+            <input id="rowsInput" type="number" min="5" max="100" value="25" />
+          </label>
+        </div>
+
+        <div class="action-row">
+          <button id="loadEventsButton" class="btn btn-secondary" type="button">Refresh Events</button>
+          <button id="simulateButton" class="btn btn-primary" type="button">Run Simulation</button>
+        </div>
+
+        <p id="status" class="status idle">Ready.</p>
+        <p id="formStatus" class="status idle"></p>
+        <p id="error" class="error" hidden></p>
+      </section>
+
+      <section id="resultsSection" class="card results" hidden>
+        <div class="summary-grid">
+          <article class="metric">
+            <h2>Event</h2>
+            <p id="eventLabel">-</p>
+          </article>
+          <article class="metric">
+            <h2>Simulations</h2>
+            <p id="simLabel">-</p>
+          </article>
+          <article class="metric">
+            <h2>Generated</h2>
+            <p id="generatedLabel">-</p>
+          </article>
+          <article class="metric">
+            <h2>Projected Winner</h2>
+            <p id="winnerLabel">-</p>
+          </article>
+          <article class="metric">
+            <h2>Season Window</h2>
+            <p id="seasonWindowLabel">-</p>
+          </article>
+        </div>
+
+        <div class="chart-wrap">
+          <h3>Top 10 by Win Probability</h3>
+          <div id="winChart" class="bar-chart"></div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Player</th>
+                <th>Win %</th>
+                <th>Top 3 %</th>
+                <th>Top 5 %</th>
+                <th>Top 10 %</th>
+                <th>Avg Finish</th>
+                <th>Baseline Win %</th>
+                <th>Baseline Season</th>
+                <th>Current Season</th>
+                <th>Form Delta</th>
+              </tr>
+            </thead>
+            <tbody id="resultsBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="/assets/app.js"></script>
+  </body>
+</html>
