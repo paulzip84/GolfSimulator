@@ -21,7 +21,21 @@ def _players():
 
 class _SeasonalClient:
     async def get_field_updates(self, tour: str = "pga", event_id: Optional[str] = None):
-        return {"event_id": "ACTIVE123", "event_name": "Active Event", "field": _players()}
+        field_rows = []
+        for idx, row in enumerate(_players(), start=1):
+            field_rows.append(
+                {
+                    "player_id": row["player_id"],
+                    "player_name": row["player_name"],
+                    "position": f"T{idx}",
+                    "score_to_par": -float(idx % 3),
+                    "thru": 18,
+                    "today": -1 if idx % 2 == 0 else 0,
+                    "round_scores": [70 + (idx % 2), 69],
+                    "hole_scores": [4, 4, 3, 5, 4, 4, 3, 4, 5],
+                }
+            )
+        return {"event_id": "ACTIVE123", "event_name": "Active Event", "field": field_rows}
 
     async def get_pre_tournament(
         self,
@@ -54,6 +68,26 @@ class _SeasonalClient:
                 }
             )
         return {"decomposition": rows}
+
+    async def get_in_play(
+        self,
+        tour: str = "pga",
+        dead_heat: str = "no",
+        odds_format: str = "percent",
+    ):
+        rows = []
+        for idx, row in enumerate(_players(), start=1):
+            rows.append(
+                {
+                    "player_id": row["player_id"],
+                    "player_name": row["player_name"],
+                    "position": f"T{idx + 1}",
+                    "score_to_par": -float((idx % 3) + 1),
+                    "thru": "F",
+                    "today": 1 if idx % 2 == 0 else -1,
+                }
+            )
+        return {"preds": rows}
 
     async def get_historical_event_list(self, tour: str = "pga"):
         return [
@@ -138,6 +172,13 @@ def test_seasonal_form_changes_player_ordering() -> None:
     assert by_name["Player 2"].form_delta_metric < 0.0
     assert by_name["Player 1"].baseline_season_metric is not None
     assert by_name["Player 1"].current_season_metric is not None
+    # In-play values should override field-updates values when available.
+    assert by_name["Player 1"].current_position == "T2"
+    assert by_name["Player 1"].current_score_to_par == -2.0
+    assert by_name["Player 1"].current_thru == "F"
+    assert by_name["Player 1"].today_score_to_par == -1.0
+    assert by_name["Player 1"].round_scores == [71.0, 69.0]
+    assert by_name["Player 1"].hole_scores == [4, 4, 3, 5, 4, 4, 3, 4, 5]
 
 
 def test_seasonal_form_gracefully_falls_back_when_data_missing() -> None:

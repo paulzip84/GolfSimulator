@@ -114,6 +114,22 @@ class DataGolfClient:
         # Current-week decomposition feed is keyed by tour only.
         return await self._get_json("preds/player-decompositions", params={"tour": tour_code})
 
+    async def get_in_play(
+        self,
+        tour: str = "pga",
+        dead_heat: str = "no",
+        odds_format: str = "percent",
+    ) -> Any:
+        tour_code = self._normalize_tour(tour)
+        return await self._get_json(
+            "preds/in-play",
+            params={
+                "tour": tour_code,
+                "dead_heat": dead_heat,
+                "odds_format": odds_format,
+            },
+        )
+
     async def get_historical_event_list(self, tour: str = "pga") -> Any:
         tour_code = self._normalize_tour(tour)
         return await self._get_json("historical-event-data/event-list", params={"tour": tour_code})

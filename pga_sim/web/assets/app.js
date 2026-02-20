@@ -1,6 +1,85 @@
 const state = {
   events: [],
   latestResult: null,
+  expandedPlayerKey: null,
+};
+
+const TABLE_TOOLTIPS = {
+  rank: {
+    layman: "Where this player ranks overall in this simulation run.",
+    source: "Calculated by this app from simulated tournament outcomes.",
+    calculation: "Players are sorted from highest to lowest Win %.",
+  },
+  player: {
+    layman: "The golfer's name.",
+    source: "DataGolf current-week field and prediction feeds.",
+    calculation: "Name is matched across field, prediction, and decomposition data.",
+  },
+  current_position: {
+    layman: "Where the player currently sits on the live leaderboard.",
+    source: "DataGolf `field-updates` endpoint (current-week live event feed).",
+    calculation: "Direct leaderboard position value provided by DataGolf for the active event.",
+  },
+  current_score_to_par: {
+    layman: "Player's live total score relative to par.",
+    source: "DataGolf `field-updates` endpoint.",
+    calculation: "Direct live to-par tournament total (E = even par, negative is better).",
+  },
+  today_score_to_par: {
+    layman: "Player's score relative to par for the current round only.",
+    source: "DataGolf `field-updates` endpoint.",
+    calculation: "Direct round-to-date to-par value from live scoring data.",
+  },
+  current_thru: {
+    layman: "How many holes the player has completed (or final status).",
+    source: "DataGolf `field-updates` endpoint.",
+    calculation: "Direct live progress indicator (for example 12, 18, or F).",
+  },
+  win_probability: {
+    layman: "Chance this player wins the tournament.",
+    source: "Hybrid Markov + Monte Carlo simulation built from DataGolf player inputs.",
+    calculation: "Share of simulations where the player finishes with the best score (ties split proportionally).",
+  },
+  top_3_probability: {
+    layman: "Chance this player finishes in the top 3.",
+    source: "Hybrid Markov + Monte Carlo simulation.",
+    calculation: "Share of simulations where the player's simulated finish rank is 1-3.",
+  },
+  top_5_probability: {
+    layman: "Chance this player finishes in the top 5.",
+    source: "Hybrid Markov + Monte Carlo simulation.",
+    calculation: "Share of simulations where the player's simulated finish rank is 1-5.",
+  },
+  top_10_probability: {
+    layman: "Chance this player finishes in the top 10.",
+    source: "Hybrid Markov + Monte Carlo simulation.",
+    calculation: "Share of simulations where the player's simulated finish rank is 1-10.",
+  },
+  mean_finish: {
+    layman: "Average finishing position across all simulations.",
+    source: "Hybrid Markov + Monte Carlo simulation.",
+    calculation: "Mean of simulated finish ranks over all tournament runs.",
+  },
+  baseline_win_probability: {
+    layman: "DataGolf's pre-tournament win probability baseline.",
+    source: "DataGolf `preds/pre-tournament` endpoint.",
+    calculation: "Direct baseline value from DataGolf; shown as a percent.",
+  },
+  baseline_season_metric: {
+    layman: "Player's baseline performance level from the selected baseline season.",
+    source: "DataGolf `historical-event-data/event-list` and `historical-event-data/events`.",
+    calculation: "Average event-level form metric across baseline-season events (DG Points first, then fallback metrics).",
+  },
+  current_season_metric: {
+    layman: "Player's performance level from the selected current season.",
+    source: "DataGolf `historical-event-data/event-list` and `historical-event-data/events`.",
+    calculation: "Average event-level form metric across current-season events (same metric logic as baseline season).",
+  },
+  form_delta_metric: {
+    layman: "How much current-season form differs from baseline season form.",
+    source: "Derived from baseline and current season metrics in this app.",
+    calculation: "Current Season metric minus Baseline Season metric.",
+  },
 };
 
 const ui = {
@@ -86,6 +165,172 @@ function formatMetric(value) {
     return "-";
   }
   return Number(value).toFixed(3);
+}
+
+function formatScoreToPar(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "-";
+  }
+  if (Math.abs(numeric) < 1e-9) {
+    return "E";
+  }
+  const absoluteText = Number.isInteger(numeric)
+    ? Math.abs(numeric).toFixed(0)
+    : Math.abs(numeric).toFixed(1).replace(/\.0$/, "");
+  return `${numeric > 0 ? "+" : "-"}${absoluteText}`;
+}
+
+function formatRoundScore(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "-";
+  }
+  return Number.isInteger(numeric) ? String(Math.trunc(numeric)) : numeric.toFixed(1);
+}
+
+function formatThru(value) {
+  if (value == null || value === "") {
+    return "-";
+  }
+  return String(value);
+}
+
+function playerRowKey(player, index) {
+  const id = String(player.player_id || "").trim();
+  if (id) {
+    return id;
+  }
+  return `${player.player_name || "player"}-${index}`;
+}
+
+function tooltipForColumn(columnKey) {
+  const entry = TABLE_TOOLTIPS[columnKey];
+  if (!entry) {
+    return "";
+  }
+  return `Layman's Terms: ${entry.layman}\nData Source: ${entry.source}\nCalculation: ${entry.calculation}`;
+}
+
+function applyTableHeaderTooltips() {
+  const headers = document.querySelectorAll("thead th[data-col]");
+  headers.forEach((header) => {
+    const key = header.dataset.col;
+    const tooltip = tooltipForColumn(key);
+    if (!tooltip) {
+      return;
+    }
+    header.title = tooltip;
+  });
+}
+
+function appendResultCell(tr, columnKey, text, numeric = true, extraClassName = "") {
+  const td = document.createElement("td");
+  const classNames = [];
+  if (numeric) {
+    classNames.push("num");
+  }
+  if (extraClassName) {
+    classNames.push(extraClassName);
+  }
+  if (classNames.length > 0) {
+    td.className = classNames.join(" ");
+  }
+  td.textContent = text;
+  const tooltip = tooltipForColumn(columnKey);
+  if (tooltip) {
+    td.title = tooltip;
+  }
+  tr.appendChild(td);
+}
+
+function buildPlayerCell(player, rowKey, expanded) {
+  const td = document.createElement("td");
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "player-toggle";
+  button.setAttribute("aria-expanded", String(expanded));
+  button.title = tooltipForColumn("player");
+
+  const caret = document.createElement("span");
+  caret.className = "player-toggle-caret";
+  caret.textContent = expanded ? "▼" : "▶";
+
+  const label = document.createElement("span");
+  label.className = "player-toggle-label";
+  label.textContent = player.player_name;
+
+  button.appendChild(caret);
+  button.appendChild(label);
+  button.addEventListener("click", () => {
+    if (!state.latestResult) {
+      return;
+    }
+    state.expandedPlayerKey = state.expandedPlayerKey === rowKey ? null : rowKey;
+    renderTable(state.latestResult.players);
+  });
+
+  td.appendChild(button);
+  return td;
+}
+
+function resultColumnCount() {
+  return document.querySelectorAll("thead th").length;
+}
+
+function buildScorecardDetails(player) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "scorecard-detail";
+
+  const summary = document.createElement("div");
+  summary.className = "scorecard-meta";
+  const summaryItems = [
+    { label: "Position", value: player.current_position || "-" },
+    { label: "Total", value: formatScoreToPar(player.current_score_to_par) },
+    { label: "Today", value: formatScoreToPar(player.today_score_to_par) },
+    { label: "Thru", value: formatThru(player.current_thru) },
+  ];
+
+  summaryItems.forEach((item) => {
+    const pill = document.createElement("span");
+    pill.className = "scorecard-pill";
+    pill.textContent = `${item.label}: ${item.value}`;
+    summary.appendChild(pill);
+  });
+  wrapper.appendChild(summary);
+
+  const roundScores = Array.isArray(player.round_scores) ? player.round_scores : [];
+  if (roundScores.length > 0) {
+    const rounds = document.createElement("div");
+    rounds.className = "scorecard-rounds";
+    rounds.textContent = roundScores
+      .map((score, index) => `R${index + 1}: ${formatRoundScore(score)}`)
+      .join(" | ");
+    wrapper.appendChild(rounds);
+  }
+
+  const holeScores = Array.isArray(player.hole_scores) ? player.hole_scores : [];
+  if (holeScores.length > 0) {
+    const holes = document.createElement("div");
+    holes.className = "scorecard-holes";
+    holeScores.forEach((score, index) => {
+      const chip = document.createElement("span");
+      chip.className = "hole-chip";
+      chip.textContent = `${index + 1}:${formatRoundScore(score)}`;
+      holes.appendChild(chip);
+    });
+    wrapper.appendChild(holes);
+  }
+
+  if (roundScores.length === 0 && holeScores.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "scorecard-empty";
+    empty.textContent =
+      "DataGolf live feeds currently expose leaderboard status (position/score/thru), but not per-hole scorecards for individual players.";
+    wrapper.appendChild(empty);
+  }
+
+  return wrapper;
 }
 
 function updateEventSelect(events) {
@@ -201,28 +446,76 @@ function renderTable(players) {
   ui.resultsBody.innerHTML = "";
   const rowLimit = Math.max(5, Math.min(100, Number.parseInt(ui.rowsInput.value, 10) || 25));
   const rows = players.slice(0, rowLimit);
+  const visibleRowKeys = new Set(rows.map((player, index) => playerRowKey(player, index)));
+
+  if (state.expandedPlayerKey && !visibleRowKeys.has(state.expandedPlayerKey)) {
+    state.expandedPlayerKey = null;
+  }
 
   rows.forEach((player, index) => {
+    const rowKey = playerRowKey(player, index);
+    const expanded = state.expandedPlayerKey === rowKey;
     const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td class="num">${index + 1}</td>
-      <td>${player.player_name}</td>
-      <td class="num">${formatPct(player.win_probability)}</td>
-      <td class="num">${formatPct(player.top_3_probability)}</td>
-      <td class="num">${formatPct(player.top_5_probability)}</td>
-      <td class="num">${formatPct(player.top_10_probability)}</td>
-      <td class="num">${Number(player.mean_finish).toFixed(2)}</td>
-      <td class="num">${formatPct(player.baseline_win_probability)}</td>
-      <td class="num">${formatMetric(player.baseline_season_metric)}</td>
-      <td class="num">${formatMetric(player.current_season_metric)}</td>
-      <td class="num">${formatMetric(player.form_delta_metric)}</td>
-    `;
+    if (expanded) {
+      tr.classList.add("result-row-expanded");
+    }
+    appendResultCell(tr, "rank", String(index + 1), true);
+    tr.appendChild(buildPlayerCell(player, rowKey, expanded));
+    appendResultCell(tr, "current_position", player.current_position || "-", false);
+    appendResultCell(
+      tr,
+      "current_score_to_par",
+      formatScoreToPar(player.current_score_to_par),
+      true
+    );
+    appendResultCell(
+      tr,
+      "today_score_to_par",
+      formatScoreToPar(player.today_score_to_par),
+      true
+    );
+    appendResultCell(tr, "current_thru", formatThru(player.current_thru), false);
+    appendResultCell(tr, "win_probability", formatPct(player.win_probability), true);
+    appendResultCell(tr, "top_3_probability", formatPct(player.top_3_probability), true);
+    appendResultCell(tr, "top_5_probability", formatPct(player.top_5_probability), true);
+    appendResultCell(tr, "top_10_probability", formatPct(player.top_10_probability), true);
+    appendResultCell(tr, "mean_finish", Number(player.mean_finish).toFixed(2), true);
+    appendResultCell(
+      tr,
+      "baseline_win_probability",
+      formatPct(player.baseline_win_probability),
+      true
+    );
+    appendResultCell(
+      tr,
+      "baseline_season_metric",
+      formatMetric(player.baseline_season_metric),
+      true
+    );
+    appendResultCell(
+      tr,
+      "current_season_metric",
+      formatMetric(player.current_season_metric),
+      true
+    );
+    appendResultCell(tr, "form_delta_metric", formatMetric(player.form_delta_metric), true);
     ui.resultsBody.appendChild(tr);
+
+    if (expanded) {
+      const detailTr = document.createElement("tr");
+      detailTr.className = "scorecard-row";
+      const detailTd = document.createElement("td");
+      detailTd.colSpan = resultColumnCount();
+      detailTd.appendChild(buildScorecardDetails(player));
+      detailTr.appendChild(detailTd);
+      ui.resultsBody.appendChild(detailTr);
+    }
   });
 }
 
 function renderResult(payload) {
   state.latestResult = payload;
+  state.expandedPlayerKey = null;
   const topPlayer = payload.players[0];
 
   ui.eventLabel.textContent = payload.event_name || payload.event_id || "Unknown event";
@@ -349,6 +642,7 @@ function init() {
   const currentYear = new Date().getFullYear();
   ui.currentSeasonInput.value = String(currentYear);
   ui.baselineSeasonInput.value = String(currentYear - 1);
+  applyTableHeaderTooltips();
   bindEvents();
   ui.meanReversionValue.textContent = Number.parseFloat(ui.meanReversionInput.value).toFixed(2);
   ui.seasonalWeightValue.textContent = Number.parseFloat(ui.seasonalWeightInput.value).toFixed(2);

@@ -46,6 +46,12 @@ class PlayerSimulationOutput(BaseModel):
     form_delta_metric: Optional[float] = None
     baseline_season_rounds: int = 0
     current_season_rounds: int = 0
+    current_position: Optional[str] = None
+    current_score_to_par: Optional[float] = None
+    current_thru: Optional[str] = None
+    today_score_to_par: Optional[float] = None
+    round_scores: list[float] = Field(default_factory=list)
+    hole_scores: list[int] = Field(default_factory=list)
 
 
 class SimulationResponse(BaseModel):

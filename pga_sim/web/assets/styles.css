@@ -282,7 +282,7 @@ output {
 table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 980px;
+  min-width: 1240px;
 }
 
 th,
@@ -304,9 +304,98 @@ tbody tr:hover {
   background: #f6fbfa;
 }
 
+tbody tr.scorecard-row:hover {
+  background: transparent;
+}
+
 td.num {
   text-align: right;
   font-family: "IBM Plex Mono", monospace;
+}
+
+.player-toggle {
+  border: 0;
+  background: transparent;
+  color: #0c6058;
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+
+.player-toggle:hover {
+  color: #063d38;
+}
+
+.player-toggle-caret {
+  font-size: 0.72rem;
+  width: 0.9rem;
+  text-align: center;
+  color: #225a55;
+}
+
+.player-toggle-label {
+  white-space: nowrap;
+}
+
+.result-row-expanded {
+  background: #eef8f6;
+}
+
+.scorecard-row td {
+  background: #f8fcfb;
+  border-bottom: 1px solid #e2ecea;
+  padding: 12px 14px;
+}
+
+.scorecard-detail {
+  display: grid;
+  gap: 8px;
+}
+
+.scorecard-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.scorecard-pill {
+  border: 1px solid #cde0dc;
+  border-radius: 999px;
+  padding: 3px 10px;
+  background: #ffffff;
+  color: #245b55;
+  font-size: 0.8rem;
+}
+
+.scorecard-rounds {
+  font-family: "IBM Plex Mono", monospace;
+  color: #2f4f4c;
+  font-size: 0.87rem;
+}
+
+.scorecard-holes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.hole-chip {
+  border: 1px solid #d3dfdc;
+  border-radius: 8px;
+  padding: 2px 7px;
+  font-family: "IBM Plex Mono", monospace;
+  background: #fff;
+  color: #2f4f4c;
+  font-size: 0.8rem;
+}
+
+.scorecard-empty {
+  color: var(--muted);
+  font-size: 0.86rem;
 }
 
 @keyframes rise {

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import re
 from statistics import NormalDist
@@ -43,6 +43,70 @@ _ROUND_METRIC_RULES: tuple[tuple[str, float], ...] = (
     ("round_score_to_par", -1.0),
     ("score_relative_to_field", -1.0),
 )
+_LIVE_POSITION_KEYS = (
+    "position",
+    "current_position",
+    "pos",
+    "current_pos",
+    "rank",
+    "place",
+    "leaderboard_position",
+)
+_LIVE_SCORE_TO_PAR_KEYS = (
+    "score_to_par",
+    "to_par",
+    "total_to_par",
+    "tot",
+    "overall_to_par",
+    "cum_to_par",
+)
+_LIVE_THRU_KEYS = (
+    "thru",
+    "through",
+    "holes_completed",
+    "holes_played",
+    "current_hole",
+)
+_LIVE_TODAY_KEYS = (
+    "today",
+    "today_to_par",
+    "round_score_to_par",
+    "round_to_par",
+    "current_round_to_par",
+)
+_LIVE_ROUND_SCORE_KEYS = (
+    "round_scores",
+    "scores_by_round",
+    "strokes_by_round",
+    "round_scorecard",
+    "scorecard_rounds",
+)
+_LIVE_HOLE_SCORE_KEYS = (
+    "hole_scores",
+    "scores_by_hole",
+    "strokes_by_hole",
+    "hole_by_hole",
+    "scorecard_holes",
+)
+_ROUND_SCORE_FLAT_KEYS = (
+    "r1",
+    "r2",
+    "r3",
+    "r4",
+    "round1",
+    "round2",
+    "round3",
+    "round4",
+    "score_r1",
+    "score_r2",
+    "score_r3",
+    "score_r4",
+)
+_HOLE_SCORE_FLAT_KEYS = tuple(
+    [f"h{idx}" for idx in range(1, 19)]
+    + [f"hole{idx}" for idx in range(1, 19)]
+    + [f"hole_{idx}" for idx in range(1, 19)]
+)
 
 
 @dataclass
@@ -62,6 +126,22 @@ class _PlayerRecord:
     current_season_rounds: int = 0
     baseline_season_volatility: float | None = None
     current_season_volatility: float | None = None
+    current_position: str | None = None
+    current_score_to_par: float | None = None
+    current_thru: str | None = None
+    today_score_to_par: float | None = None
+    round_scores: list[float] = field(default_factory=list)
+    hole_scores: list[int] = field(default_factory=list)
+
+
+@dataclass
+class _LiveScoreSnapshot:
+    current_position: str | None = None
+    current_score_to_par: float | None = None
+    current_thru: str | None = None
+    today_score_to_par: float | None = None
+    round_scores: list[float] = field(default_factory=list)
+    hole_scores: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -158,6 +238,16 @@ class SimulationService:
                 event_id=request.event_id,
             ),
         )
+        live_payload: Any = {}
+        get_in_play = getattr(self._datagolf, "get_in_play", None)
+        if callable(get_in_play):
+            try:
+                live_payload = await get_in_play(
+                    tour=request.tour,
+                    odds_format="percent",
+                )
+            except DataGolfAPIError:
+                live_payload = {}
 
         selected_event_id = _normalized_event_id(request.event_id)
         active_event_id = _normalized_event_id(_string_from_payload(field_payload, _EVENT_ID_KEYS))
@@ -169,10 +259,11 @@ class SimulationService:
             )
 
         field_rows = _extract_rows(field_payload, ("field", "player"))
+        live_rows = _extract_rows(live_payload, ("in-play", "player", "pred"))
         pre_rows = _extract_rows(pre_payload, ("pred", "tournament", "player"))
         decomp_rows = _extract_rows(decomp_payload, ("decomposition", "player"))
 
-        players = self._merge_player_records(field_rows, pre_rows, decomp_rows)
+        players = self._merge_player_records(field_rows, pre_rows, decomp_rows, live_rows)
         if len(players) < 8:
             raise ValueError(
                 "Unable to build enough players from DataGolf payloads. "
@@ -266,6 +357,12 @@ class SimulationService:
                     form_delta_metric=record.form_delta_metric,
                     baseline_season_rounds=record.baseline_season_rounds,
                     current_season_rounds=record.current_season_rounds,
+                    current_position=record.current_position,
+                    current_score_to_par=record.current_score_to_par,
+                    current_thru=record.current_thru,
+                    today_score_to_par=record.today_score_to_par,
+                    round_scores=record.round_scores,
+                    hole_scores=record.hole_scores,
                 )
             )
 
@@ -294,6 +391,7 @@ class SimulationService:
         field_rows: list[dict[str, Any]],
         pre_rows: list[dict[str, Any]],
         decomp_rows: list[dict[str, Any]],
+        live_rows: list[dict[str, Any]] | None = None,
     ) -> list[_PlayerRecord]:
         merged: dict[str, _PlayerRecord] = {}
         name_index: dict[str, str] = {}
@@ -303,7 +401,57 @@ class SimulationService:
             if not key:
                 continue
             resolved_key = _resolve_player_key(key, player_name, merged, name_index)
-            merged[resolved_key] = _PlayerRecord(player_id=player_id, player_name=player_name)
+            live_snapshot = _extract_live_score_snapshot(row)
+            record = merged.get(resolved_key)
+            if record is None:
+                record = _PlayerRecord(player_id=player_id, player_name=player_name)
+                merged[resolved_key] = record
+            else:
+                if not record.player_id and player_id:
+                    record.player_id = player_id
+                if not record.player_name and player_name:
+                    record.player_name = player_name
+
+            if live_snapshot.current_position is not None:
+                record.current_position = live_snapshot.current_position
+            if live_snapshot.current_score_to_par is not None:
+                record.current_score_to_par = live_snapshot.current_score_to_par
+            if live_snapshot.current_thru is not None:
+                record.current_thru = live_snapshot.current_thru
+            if live_snapshot.today_score_to_par is not None:
+                record.today_score_to_par = live_snapshot.today_score_to_par
+            if live_snapshot.round_scores:
+                record.round_scores = live_snapshot.round_scores
+            if live_snapshot.hole_scores:
+                record.hole_scores = live_snapshot.hole_scores
+            name_index[_normalized_name(player_name)] = resolved_key
+
+        for row in live_rows or []:
+            key, player_id, player_name = _player_identity(row)
+            if not key:
+                continue
+            resolved_key = _resolve_player_key(key, player_name, merged, name_index)
+            record = merged.setdefault(
+                resolved_key,
+                _PlayerRecord(player_id=player_id, player_name=player_name),
+            )
+            if not record.player_id and player_id:
+                record.player_id = player_id
+            if not record.player_name and player_name:
+                record.player_name = player_name
+            live_snapshot = _extract_live_score_snapshot(row)
+            if live_snapshot.current_position is not None:
+                record.current_position = live_snapshot.current_position
+            if live_snapshot.current_score_to_par is not None:
+                record.current_score_to_par = live_snapshot.current_score_to_par
+            if live_snapshot.current_thru is not None:
+                record.current_thru = live_snapshot.current_thru
+            if live_snapshot.today_score_to_par is not None:
+                record.today_score_to_par = live_snapshot.today_score_to_par
+            if live_snapshot.round_scores:
+                record.round_scores = live_snapshot.round_scores
+            if live_snapshot.hole_scores:
+                record.hole_scores = live_snapshot.hole_scores
             name_index[_normalized_name(player_name)] = resolved_key
 
         for row in pre_rows:
@@ -714,6 +862,211 @@ def _season_from_row(row: dict[str, Any]) -> int | None:
         if prefix.isdigit():
             return int(prefix)
     return None
+
+
+def _extract_live_score_snapshot(row: dict[str, Any]) -> _LiveScoreSnapshot:
+    return _LiveScoreSnapshot(
+        current_position=_normalize_position_value(_value_from_payload(row, _LIVE_POSITION_KEYS)),
+        current_score_to_par=_score_to_par_from_payload(row, _LIVE_SCORE_TO_PAR_KEYS),
+        current_thru=_normalize_thru_value(_value_from_payload(row, _LIVE_THRU_KEYS)),
+        today_score_to_par=_score_to_par_from_payload(row, _LIVE_TODAY_KEYS),
+        round_scores=_round_scores_from_live_row(row),
+        hole_scores=_hole_scores_from_live_row(row),
+    )
+
+
+def _round_scores_from_live_row(row: dict[str, Any]) -> list[float]:
+    raw_scores = _value_from_payload(row, _LIVE_ROUND_SCORE_KEYS)
+    if raw_scores is not None:
+        extracted = _sanitize_round_scores(_numeric_sequence_from_value(raw_scores))
+        if 1 <= len(extracted) <= 6:
+            return extracted
+
+    flattened: list[float] = []
+    for key in _ROUND_SCORE_FLAT_KEYS:
+        value = _numeric_from_payload(row, (key,))
+        if value is None:
+            continue
+        flattened.append(value)
+    return _sanitize_round_scores(flattened[:6])
+
+
+def _hole_scores_from_live_row(row: dict[str, Any]) -> list[int]:
+    raw_scores = _value_from_payload(row, _LIVE_HOLE_SCORE_KEYS)
+    if raw_scores is not None:
+        extracted = _sanitize_hole_scores(_numeric_sequence_from_value(raw_scores))
+        if extracted:
+            return extracted
+
+    flattened: list[float] = []
+    for key in _HOLE_SCORE_FLAT_KEYS:
+        value = _numeric_from_payload(row, (key,))
+        if value is None:
+            continue
+        flattened.append(value)
+    return _sanitize_hole_scores(flattened)
+
+
+def _sanitize_round_scores(values: list[float]) -> list[float]:
+    out: list[float] = []
+    for value in values:
+        if not np.isfinite(value):
+            continue
+        if abs(value) > 250:
+            continue
+        out.append(float(value))
+    return out
+
+
+def _sanitize_hole_scores(values: list[float]) -> list[int]:
+    out: list[int] = []
+    for value in values:
+        if not np.isfinite(value):
+            continue
+        rounded = int(round(value))
+        if abs(value - rounded) > 1e-6:
+            continue
+        if 1 <= rounded <= 15:
+            out.append(rounded)
+    if len(out) > 18:
+        return out[:18]
+    return out
+
+
+def _score_to_par_from_payload(payload: Any, keys: tuple[str, ...]) -> float | None:
+    value = _value_from_payload(payload, keys)
+    return _score_to_par_from_value(value)
+
+
+def _score_to_par_from_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return _validated_to_par(float(value))
+    text = str(value).strip()
+    if not text:
+        return None
+
+    normalized = text.upper().replace("−", "-")
+    if normalized in {"E", "EVEN", "PAR"}:
+        return 0.0
+
+    direct = re.fullmatch(r"[+-]?\d+(?:\.\d+)?", normalized)
+    if direct:
+        return _validated_to_par(float(normalized))
+
+    wrapped = re.fullmatch(r"\(([+-]?\d+(?:\.\d+)?)\)", normalized)
+    if wrapped:
+        return _validated_to_par(float(wrapped.group(1)))
+
+    words = re.fullmatch(r"(\d+(?:\.\d+)?)\s+(UNDER|OVER)", normalized)
+    if words:
+        magnitude = float(words.group(1))
+        signed = -magnitude if words.group(2) == "UNDER" else magnitude
+        return _validated_to_par(signed)
+    return None
+
+
+def _validated_to_par(value: float) -> float | None:
+    if abs(value) > 80:
+        return None
+    return value
+
+
+def _normalize_position_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        if float(value).is_integer():
+            return str(int(value))
+        return str(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    normalized = text.upper().replace("−", "-")
+    if normalized in {"WD", "MC", "DQ", "DNS", "DNF"}:
+        return normalized
+
+    tie_match = re.fullmatch(r"T\s*([+-]?\d+(?:\.\d+)?)", normalized)
+    if tie_match:
+        number = float(tie_match.group(1))
+        number_text = str(int(number)) if number.is_integer() else str(number)
+        return f"T{number_text}"
+
+    straight_match = re.fullmatch(r"[+-]?\d+(?:\.\d+)?", normalized)
+    if straight_match:
+        number = float(normalized)
+        if number.is_integer():
+            return str(int(number))
+        return str(number)
+    return text
+
+
+def _normalize_thru_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        if float(value).is_integer():
+            return str(int(value))
+        return str(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    normalized = text.upper()
+    if normalized in {"F", "FIN", "FINAL", "COMPLETE", "COMPLETED"}:
+        return "F"
+    if normalized in {"WD", "MC", "DQ"}:
+        return normalized
+
+    prefix_match = re.match(r"THRU\s+(\d{1,2})$", normalized)
+    if prefix_match:
+        return prefix_match.group(1)
+
+    digit_match = re.fullmatch(r"\d{1,2}", normalized)
+    if digit_match:
+        return digit_match.group(0)
+    return text
+
+
+def _numeric_from_payload(payload: Any, keys: tuple[str, ...]) -> float | None:
+    value = _value_from_payload(payload, keys)
+    return _to_float(value)
+
+
+def _value_from_payload(payload: Any, keys: tuple[str, ...]) -> Any:
+    if isinstance(payload, dict):
+        lowered = {str(k).lower(): v for k, v in payload.items()}
+        for key in keys:
+            if key not in lowered:
+                continue
+            value = lowered[key]
+            if _is_empty_payload_value(value):
+                continue
+            return value
+        for nested in lowered.values():
+            nested_value = _value_from_payload(nested, keys)
+            if nested_value is not None:
+                return nested_value
+    elif isinstance(payload, list):
+        for item in payload:
+            nested_value = _value_from_payload(item, keys)
+            if nested_value is not None:
+                return nested_value
+    return None
+
+
+def _is_empty_payload_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    if isinstance(value, (list, dict)) and len(value) == 0:
+        return True
+    return False
 
 
 def _historical_event_descriptors(
