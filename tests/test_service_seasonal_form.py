@@ -179,6 +179,8 @@ def test_seasonal_form_changes_player_ordering() -> None:
     assert by_name["Player 1"].today_score_to_par == -1.0
     assert by_name["Player 1"].round_scores == [71.0, 69.0]
     assert by_name["Player 1"].hole_scores == [4, 4, 3, 5, 4, 4, 3, 4, 5]
+    assert result.stop_reason is not None
+    assert result.requested_simulations == 12_000
 
 
 def test_seasonal_form_gracefully_falls_back_when_data_missing() -> None:

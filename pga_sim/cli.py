@@ -35,10 +35,19 @@ async def _run_simulate_command(args: argparse.Namespace) -> None:
     request = SimulationRequest(
         tour=args.tour,
         event_id=args.event_id,
+        resolution_mode=args.resolution_mode,
         simulations=args.simulations or settings.default_simulations,
+        min_simulations=args.min_simulations,
+        simulation_batch_size=args.simulation_batch_size,
         seed=args.seed,
         cut_size=args.cut_size,
         mean_reversion=args.mean_reversion,
+        shared_round_shock_sigma=args.shared_round_shock_sigma,
+        enable_adaptive_simulation=not args.disable_adaptive_simulation,
+        ci_confidence=args.ci_confidence,
+        ci_half_width_target=args.ci_half_width_target,
+        ci_top_n=args.ci_top_n,
+        enable_in_play_conditioning=not args.disable_in_play_conditioning,
         enable_seasonal_form=not args.disable_seasonal_form,
         baseline_season=args.baseline_season,
         current_season=args.current_season,
@@ -56,6 +65,23 @@ async def _run_simulate_command(args: argparse.Namespace) -> None:
         f"\nEvent: {result.event_name or 'Unknown'} "
         f"(id={result.event_id or 'unknown'}) | sims={result.simulations}"
     )
+    if result.requested_simulations and result.requested_simulations != result.simulations:
+        print(
+            f"Requested simulations: {result.requested_simulations}, "
+            f"executed: {result.simulations}, early_stop={result.adaptive_stopped_early}"
+        )
+    if result.win_ci_half_width_top_n is not None:
+        print(
+            f"Top-{request.ci_top_n} win% CI half-width: "
+            f"{100.0 * result.win_ci_half_width_top_n:.3f}%"
+        )
+    if result.stop_reason:
+        print(
+            f"Stop reason: {result.stop_reason}, ci_target_met={result.ci_target_met}, "
+            f"recommended_simulations={result.recommended_simulations}"
+        )
+    if result.in_play_conditioning_note:
+        print(f"In-play conditioning: {result.in_play_conditioning_note}")
     if result.baseline_season and result.current_season:
         print(
             f"Seasonal form blend: baseline={result.baseline_season}, "
@@ -93,10 +119,23 @@ def main() -> None:
     sim_parser = sub.add_parser("simulate", help="Run tournament simulation")
     sim_parser.add_argument("--tour", default="pga")
     sim_parser.add_argument("--event-id", default=None)
+    sim_parser.add_argument(
+        "--resolution-mode",
+        choices=["auto_target", "fixed_cap"],
+        default="auto_target",
+    )
     sim_parser.add_argument("--simulations", type=int, default=None)
+    sim_parser.add_argument("--min-simulations", type=int, default=5_000)
+    sim_parser.add_argument("--simulation-batch-size", type=int, default=5_000)
     sim_parser.add_argument("--seed", type=int, default=None)
     sim_parser.add_argument("--cut-size", type=int, default=70)
     sim_parser.add_argument("--mean-reversion", type=float, default=0.10)
+    sim_parser.add_argument("--shared-round-shock-sigma", type=float, default=0.35)
+    sim_parser.add_argument("--disable-adaptive-simulation", action="store_true")
+    sim_parser.add_argument("--ci-confidence", type=float, default=0.95)
+    sim_parser.add_argument("--ci-half-width-target", type=float, default=0.0025)
+    sim_parser.add_argument("--ci-top-n", type=int, default=10)
+    sim_parser.add_argument("--disable-in-play-conditioning", action="store_true")
     sim_parser.add_argument("--disable-seasonal-form", action="store_true")
     sim_parser.add_argument("--baseline-season", type=int, default=None)
     sim_parser.add_argument("--current-season", type=int, default=None)

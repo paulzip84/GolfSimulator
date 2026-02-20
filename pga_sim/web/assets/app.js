@@ -82,13 +82,71 @@ const TABLE_TOOLTIPS = {
   },
 };
 
+const CONTROL_TOOLTIPS = {
+  tourSelect:
+    "Choose which tour feed to simulate. Events and player pools come from this selected tour.",
+  eventSelect:
+    "Select a specific active event. Auto uses the latest event currently available in DataGolf feeds.",
+  simulationsInput:
+    "Maximum simulations to run (hard cap). In Auto Target mode this is a safety cap.",
+  resolutionModeSelect:
+    "Auto Target: stop when CI precision target is met; Fixed Cap: always run exactly Simulations.",
+  minSimulationsInput:
+    "Minimum simulations to run before adaptive early-stop is allowed. If this is above Simulations, it is effectively capped at Simulations.",
+  simulationBatchSizeInput:
+    "Simulations are processed in batches for adaptive checks. Larger batches are faster but stop less precisely.",
+  cutSizeInput:
+    "Projected cut line size after round 2 (ties included).",
+  meanReversionInput:
+    "Base strength of pull back toward field-average state each round.",
+  sharedRoundShockInput:
+    "Common round shock applied to all players each round (weather/course day effect correlation).",
+  useAdaptiveSimulationSelect:
+    "If enabled, simulation can stop early once top-N win probability confidence intervals are narrow enough.",
+  ciConfidenceInput:
+    "Confidence level for adaptive stopping (for example 0.95). Higher confidence usually requires more simulations.",
+  ciHalfWidthTargetInput:
+    "Target half-width for top-N win probability confidence intervals. Smaller target means more simulations.",
+  ciTopNInput:
+    "Adaptive stopping monitors the worst CI half-width among the top-N win probability players.",
+  useInPlayConditioningSelect:
+    "If enabled, simulations condition on current live scores/thru and only simulate remaining tournament steps.",
+  useSeasonalFormSelect:
+    "Enable blending baseline vs current-season form metrics into player skill inputs.",
+  baselineSeasonInput:
+    "Baseline comparison season for form modeling.",
+  currentSeasonInput:
+    "Current season for form modeling and delta calculations.",
+  seasonalWeightInput:
+    "Overall weight of seasonal form signal versus baseline DataGolf priors.",
+  currentSeasonWeightInput:
+    "Within seasonal form, weight assigned to current season vs baseline season.",
+  formDeltaWeightInput:
+    "Extra emphasis on the change from baseline season to current season form.",
+  seedInput:
+    "Optional random seed for reproducible simulation outputs. Leave blank for random run-to-run variation.",
+  rowsInput:
+    "Number of ranked players to display in the results table.",
+};
+
 const ui = {
   tourSelect: document.getElementById("tourSelect"),
   eventSelect: document.getElementById("eventSelect"),
   simulationsInput: document.getElementById("simulationsInput"),
+  resolutionModeSelect: document.getElementById("resolutionModeSelect"),
+  minSimulationsInput: document.getElementById("minSimulationsInput"),
+  simulationBatchSizeInput: document.getElementById("simulationBatchSizeInput"),
   cutSizeInput: document.getElementById("cutSizeInput"),
   meanReversionInput: document.getElementById("meanReversionInput"),
   meanReversionValue: document.getElementById("meanReversionValue"),
+  sharedRoundShockInput: document.getElementById("sharedRoundShockInput"),
+  sharedRoundShockValue: document.getElementById("sharedRoundShockValue"),
+  useAdaptiveSimulationSelect: document.getElementById("useAdaptiveSimulationSelect"),
+  ciConfidenceInput: document.getElementById("ciConfidenceInput"),
+  ciConfidenceValue: document.getElementById("ciConfidenceValue"),
+  ciHalfWidthTargetInput: document.getElementById("ciHalfWidthTargetInput"),
+  ciTopNInput: document.getElementById("ciTopNInput"),
+  useInPlayConditioningSelect: document.getElementById("useInPlayConditioningSelect"),
   useSeasonalFormSelect: document.getElementById("useSeasonalFormSelect"),
   baselineSeasonInput: document.getElementById("baselineSeasonInput"),
   currentSeasonInput: document.getElementById("currentSeasonInput"),
@@ -102,6 +160,7 @@ const ui = {
   rowsInput: document.getElementById("rowsInput"),
   loadEventsButton: document.getElementById("loadEventsButton"),
   simulateButton: document.getElementById("simulateButton"),
+  applyRecommendationButton: document.getElementById("applyRecommendationButton"),
   status: document.getElementById("status"),
   formStatus: document.getElementById("formStatus"),
   error: document.getElementById("error"),
@@ -140,6 +199,9 @@ function setFormStatus(message = "", running = false) {
 function setBusy(isBusy) {
   ui.simulateButton.disabled = isBusy;
   ui.loadEventsButton.disabled = isBusy;
+  if (ui.applyRecommendationButton) {
+    ui.applyRecommendationButton.disabled = isBusy;
+  }
 }
 
 function formatPct(probability) {
@@ -221,6 +283,24 @@ function applyTableHeaderTooltips() {
       return;
     }
     header.title = tooltip;
+  });
+}
+
+function applyControlTooltips() {
+  Object.entries(CONTROL_TOOLTIPS).forEach(([elementId, tooltip]) => {
+    const input = document.getElementById(elementId);
+    if (!input || !tooltip) {
+      return;
+    }
+    input.title = tooltip;
+    const label = input.closest("label");
+    if (label) {
+      label.title = tooltip;
+      const caption = label.querySelector("span");
+      if (caption) {
+        caption.title = tooltip;
+      }
+    }
   });
 }
 
@@ -519,7 +599,14 @@ function renderResult(payload) {
   const topPlayer = payload.players[0];
 
   ui.eventLabel.textContent = payload.event_name || payload.event_id || "Unknown event";
-  ui.simLabel.textContent = payload.simulations.toLocaleString();
+  if (
+    payload.requested_simulations &&
+    payload.requested_simulations !== payload.simulations
+  ) {
+    ui.simLabel.textContent = `${payload.simulations.toLocaleString()} / ${payload.requested_simulations.toLocaleString()} requested`;
+  } else {
+    ui.simLabel.textContent = payload.simulations.toLocaleString();
+  }
   ui.generatedLabel.textContent = formatDate(payload.generated_at);
   ui.winnerLabel.textContent = topPlayer
     ? `${topPlayer.player_name} (${formatPct(topPlayer.win_probability)})`
@@ -537,6 +624,17 @@ function renderResult(payload) {
         : "Seasonal form adjustment not applied."
   );
 
+  if (
+    ui.applyRecommendationButton &&
+    payload.recommended_simulations &&
+    payload.stop_reason === "max_simulations_reached"
+  ) {
+    ui.applyRecommendationButton.hidden = false;
+    ui.applyRecommendationButton.textContent = `Use Recommended Cap (${payload.recommended_simulations.toLocaleString()})`;
+  } else if (ui.applyRecommendationButton) {
+    ui.applyRecommendationButton.hidden = true;
+  }
+
   renderWinChart(payload.players);
   renderTable(payload.players);
   ui.resultsSection.hidden = false;
@@ -550,8 +648,17 @@ async function runSimulation() {
 
   try {
     const simulations = Number.parseInt(ui.simulationsInput.value, 10) || 10000;
+    const minSimulations = Number.parseInt(ui.minSimulationsInput.value, 10) || 5000;
+    const simulationBatchSize = Number.parseInt(ui.simulationBatchSizeInput.value, 10) || 5000;
     const cutSize = Number.parseInt(ui.cutSizeInput.value, 10) || 70;
     const meanReversion = Number.parseFloat(ui.meanReversionInput.value) || 0.1;
+    const sharedRoundShockSigma = Number.parseFloat(ui.sharedRoundShockInput.value) || 0.35;
+    const useAdaptiveSimulation = ui.useAdaptiveSimulationSelect.value === "yes";
+    const ciConfidence = Number.parseFloat(ui.ciConfidenceInput.value) || 0.95;
+    const ciHalfWidthTarget =
+      Number.parseFloat(ui.ciHalfWidthTargetInput.value) || 0.0025;
+    const ciTopN = Number.parseInt(ui.ciTopNInput.value, 10) || 10;
+    const useInPlayConditioning = ui.useInPlayConditioningSelect.value === "yes";
     const useSeasonalForm = ui.useSeasonalFormSelect.value === "yes";
     const baselineSeason = Number.parseInt(ui.baselineSeasonInput.value, 10);
     const currentSeason = Number.parseInt(ui.currentSeasonInput.value, 10);
@@ -563,9 +670,18 @@ async function runSimulation() {
     const requestBody = {
       tour: ui.tourSelect.value,
       event_id: ui.eventSelect.value || null,
+      resolution_mode: ui.resolutionModeSelect.value || "auto_target",
       simulations: simulations,
+      min_simulations: minSimulations,
+      simulation_batch_size: simulationBatchSize,
       cut_size: cutSize,
       mean_reversion: meanReversion,
+      shared_round_shock_sigma: sharedRoundShockSigma,
+      enable_adaptive_simulation: useAdaptiveSimulation,
+      ci_confidence: ciConfidence,
+      ci_half_width_target: ciHalfWidthTarget,
+      ci_top_n: ciTopN,
+      enable_in_play_conditioning: useInPlayConditioning,
       enable_seasonal_form: useSeasonalForm,
       seasonal_form_weight: seasonalWeight,
       current_season_weight: currentSeasonWeight,
@@ -606,7 +722,17 @@ async function runSimulation() {
 
     const payload = await response.json();
     renderResult(payload);
-    setStatus("Simulation complete.");
+    const statusBits = [];
+    if (payload.stop_reason) {
+      statusBits.push(`stop=${payload.stop_reason}`);
+    }
+    if (payload.win_ci_half_width_top_n != null) {
+      statusBits.push(`top-N CI half-width=${(payload.win_ci_half_width_top_n * 100).toFixed(3)}%`);
+    }
+    if (payload.in_play_conditioning_note) {
+      statusBits.push(payload.in_play_conditioning_note);
+    }
+    setStatus(statusBits.length > 0 ? `Simulation complete. ${statusBits.join(" | ")}` : "Simulation complete.");
   } catch (error) {
     setStatus("Simulation failed.");
     setError(error.message || "Unexpected error while running the simulation.");
@@ -622,6 +748,12 @@ function bindEvents() {
   ui.meanReversionInput.addEventListener("input", () => {
     ui.meanReversionValue.textContent = Number.parseFloat(ui.meanReversionInput.value).toFixed(2);
   });
+  ui.sharedRoundShockInput.addEventListener("input", () => {
+    ui.sharedRoundShockValue.textContent = Number.parseFloat(ui.sharedRoundShockInput.value).toFixed(2);
+  });
+  ui.ciConfidenceInput.addEventListener("input", () => {
+    ui.ciConfidenceValue.textContent = Number.parseFloat(ui.ciConfidenceInput.value).toFixed(3);
+  });
   ui.seasonalWeightInput.addEventListener("input", () => {
     ui.seasonalWeightValue.textContent = Number.parseFloat(ui.seasonalWeightInput.value).toFixed(2);
   });
@@ -636,15 +768,36 @@ function bindEvents() {
       renderTable(state.latestResult.players);
     }
   });
+  if (ui.applyRecommendationButton) {
+    ui.applyRecommendationButton.addEventListener("click", () => {
+      if (!state.latestResult || !state.latestResult.recommended_simulations) {
+        return;
+      }
+      ui.simulationsInput.value = String(state.latestResult.recommended_simulations);
+      if (ui.minSimulationsInput) {
+        const currentMin = Number.parseInt(ui.minSimulationsInput.value, 10) || 0;
+        if (currentMin > state.latestResult.recommended_simulations) {
+          ui.minSimulationsInput.value = String(state.latestResult.recommended_simulations);
+        }
+      }
+      setStatus(
+        `Updated Simulations cap to ${Number(state.latestResult.recommended_simulations).toLocaleString()}. Run again to target CI precision.`
+      );
+    });
+  }
 }
 
 function init() {
   const currentYear = new Date().getFullYear();
   ui.currentSeasonInput.value = String(currentYear);
   ui.baselineSeasonInput.value = String(currentYear - 1);
+  ui.resolutionModeSelect.value = "auto_target";
   applyTableHeaderTooltips();
+  applyControlTooltips();
   bindEvents();
   ui.meanReversionValue.textContent = Number.parseFloat(ui.meanReversionInput.value).toFixed(2);
+  ui.sharedRoundShockValue.textContent = Number.parseFloat(ui.sharedRoundShockInput.value).toFixed(2);
+  ui.ciConfidenceValue.textContent = Number.parseFloat(ui.ciConfidenceInput.value).toFixed(3);
   ui.seasonalWeightValue.textContent = Number.parseFloat(ui.seasonalWeightInput.value).toFixed(2);
   ui.currentSeasonWeightValue.textContent = Number.parseFloat(ui.currentSeasonWeightInput.value).toFixed(2);
   ui.formDeltaWeightValue.textContent = Number.parseFloat(ui.formDeltaWeightInput.value).toFixed(2);

@@ -177,6 +177,10 @@ output {
   color: #472d08;
 }
 
+#applyRecommendationButton[hidden] {
+  display: none;
+}
+
 .status {
   margin: 14px 0 2px;
   font-family: "IBM Plex Mono", monospace;

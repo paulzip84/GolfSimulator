@@ -61,6 +61,83 @@
           </label>
 
           <label class="field">
+            <span>Shared Round Shock Sigma</span>
+            <input
+              id="sharedRoundShockInput"
+              type="range"
+              min="0"
+              max="2"
+              step="0.01"
+              value="0.35"
+            />
+            <output id="sharedRoundShockValue">0.35</output>
+          </label>
+
+          <label class="field">
+            <span>Resolution Mode</span>
+            <select id="resolutionModeSelect">
+              <option value="auto_target" selected>Auto Target</option>
+              <option value="fixed_cap">Fixed Cap</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Use Adaptive Simulation</span>
+            <select id="useAdaptiveSimulationSelect">
+              <option value="yes" selected>Yes</option>
+              <option value="no">No</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Use In-Play Conditioning</span>
+            <select id="useInPlayConditioningSelect">
+              <option value="yes" selected>Yes</option>
+              <option value="no">No</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Min Simulations</span>
+            <input id="minSimulationsInput" type="number" min="500" max="250000" step="500" value="5000" />
+          </label>
+
+          <label class="field">
+            <span>Simulation Batch Size</span>
+            <input
+              id="simulationBatchSizeInput"
+              type="number"
+              min="500"
+              max="50000"
+              step="500"
+              value="5000"
+            />
+          </label>
+
+          <label class="field">
+            <span>CI Confidence</span>
+            <input id="ciConfidenceInput" type="range" min="0.5" max="0.999" step="0.001" value="0.95" />
+            <output id="ciConfidenceValue">0.950</output>
+          </label>
+
+          <label class="field">
+            <span>CI Half-Width Target</span>
+            <input
+              id="ciHalfWidthTargetInput"
+              type="number"
+              min="0.0001"
+              max="0.05"
+              step="0.0001"
+              value="0.0025"
+            />
+          </label>
+
+          <label class="field">
+            <span>CI Top-N</span>
+            <input id="ciTopNInput" type="number" min="1" max="50" value="10" />
+          </label>
+
+          <label class="field">
             <span>Use Seasonal Form Blend</span>
             <select id="useSeasonalFormSelect">
               <option value="yes" selected>Yes</option>
@@ -110,6 +187,14 @@
         <div class="action-row">
           <button id="loadEventsButton" class="btn btn-secondary" type="button">Refresh Events</button>
           <button id="simulateButton" class="btn btn-primary" type="button">Run Simulation</button>
+          <button
+            id="applyRecommendationButton"
+            class="btn btn-secondary"
+            type="button"
+            hidden
+          >
+            Use Recommended Cap
+          </button>
         </div>
 
         <p id="status" class="status idle">Ready.</p>

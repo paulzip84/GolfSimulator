@@ -154,6 +154,15 @@ class _SeasonLoadResult:
     from_cache: bool = False
 
 
+@dataclass
+class _InPlayConditioningResult:
+    applied: bool
+    note: str | None
+    initial_totals: np.ndarray
+    round_fractions: np.ndarray
+    round_numbers: np.ndarray
+
+
 class SimulationService:
     def __init__(self, datagolf: DataGolfClient):
         self._datagolf = datagolf
@@ -316,20 +325,43 @@ class SimulationService:
         else:
             form_adjustment_note = "Seasonal form adjustment disabled."
 
+        in_play_context = self._build_in_play_conditioning_context(
+            players=players,
+            total_rounds=4,
+            enable=request.enable_in_play_conditioning,
+        )
+
         model_inputs = self._build_simulation_inputs(
             players=players,
+            base_mean_reversion=request.mean_reversion,
             seasonal_form_weight=request.seasonal_form_weight,
             current_season_weight=request.current_season_weight,
             form_delta_weight=request.form_delta_weight,
+            initial_totals=in_play_context.initial_totals,
+            round_fractions=in_play_context.round_fractions,
+            round_numbers=in_play_context.round_numbers,
         )
         simulator = HybridMarkovSimulator(
-            MarkovSimulationConfig(mean_reversion=request.mean_reversion)
+            MarkovSimulationConfig(
+                mean_reversion=request.mean_reversion,
+                round_shock_sigma=request.shared_round_shock_sigma,
+            )
+        )
+        resolution_mode = (request.resolution_mode or "auto_target").strip().lower()
+        adaptive_enabled = bool(
+            request.enable_adaptive_simulation and resolution_mode != "fixed_cap"
         )
         outputs = simulator.simulate(
             inputs=model_inputs,
             n_simulations=request.simulations,
             seed=request.seed,
             cut_size=request.cut_size,
+            adaptive=adaptive_enabled,
+            min_simulations=request.min_simulations,
+            batch_size=request.simulation_batch_size,
+            ci_confidence=request.ci_confidence,
+            ci_half_width_target=request.ci_half_width_target,
+            ci_top_n=request.ci_top_n,
         )
 
         rankings = np.argsort(outputs.win_probability)[::-1]
@@ -378,7 +410,15 @@ class SimulationService:
                 _string_from_payload(field_payload, _EVENT_NAME_KEYS)
                 or _string_from_payload(pre_payload, _EVENT_NAME_KEYS)
             ),
-            simulations=request.simulations,
+            simulations=outputs.simulations_run,
+            requested_simulations=request.simulations,
+            adaptive_stopped_early=outputs.adaptive_stopped_early,
+            win_ci_half_width_top_n=outputs.win_ci_half_width_top_n,
+            ci_target_met=outputs.ci_target_met,
+            stop_reason=outputs.stop_reason,
+            recommended_simulations=outputs.recommended_simulations,
+            in_play_conditioning_applied=in_play_context.applied,
+            in_play_conditioning_note=in_play_context.note,
             baseline_season=baseline_season if request.enable_seasonal_form else None,
             current_season=current_season if request.enable_seasonal_form else None,
             form_adjustment_applied=form_adjustment_applied,
@@ -639,9 +679,13 @@ class SimulationService:
     @staticmethod
     def _build_simulation_inputs(
         players: list[_PlayerRecord],
+        base_mean_reversion: float = 0.10,
         seasonal_form_weight: float = 0.35,
         current_season_weight: float = 0.60,
         form_delta_weight: float = 0.25,
+        initial_totals: np.ndarray | None = None,
+        round_fractions: np.ndarray | None = None,
+        round_numbers: np.ndarray | None = None,
     ) -> SimulationInputs:
         player_ids = [p.player_id for p in players]
         player_names = [p.player_name for p in players]
@@ -744,11 +788,178 @@ class SimulationService:
 
         sigma_round = np.clip(sigma_round, 2.0, 3.8)
 
+        volatility_signal = np.array(
+            [
+                (
+                    p.current_season_volatility
+                    if p.current_season_volatility is not None
+                    else p.baseline_season_volatility
+                    if p.baseline_season_volatility is not None
+                    else np.nan
+                )
+                for p in players
+            ],
+            dtype=np.float64,
+        )
+        volatility_z = _zscore_with_nan(volatility_signal)
+        observation_reliability = np.clip((baseline_rounds + current_rounds) / 30.0, 0.0, 1.0)
+        reversion_adjustment = np.where(~np.isnan(volatility_z), -0.03 * volatility_z, 0.0)
+        player_mean_reversion = (
+            np.clip(base_mean_reversion, 0.0, 0.6)
+            + (observation_reliability * reversion_adjustment)
+        )
+        player_mean_reversion = np.clip(player_mean_reversion, 0.02, 0.35)
+
+        if initial_totals is not None:
+            initial_totals = np.asarray(initial_totals, dtype=np.float64).reshape(-1)
+            if initial_totals.shape[0] != len(players):
+                initial_totals = None
+
+        if round_fractions is not None:
+            round_fractions = np.asarray(round_fractions, dtype=np.float64).reshape(-1)
+            if round_fractions.size == 0:
+                round_fractions = None
+
+        if round_numbers is not None:
+            round_numbers = np.asarray(round_numbers, dtype=np.int16).reshape(-1)
+            if round_fractions is not None and round_numbers.size != round_fractions.size:
+                round_numbers = None
+
         return SimulationInputs(
             player_ids=player_ids,
             player_names=player_names,
             mu_round=mu_round,
             sigma_round=sigma_round,
+            mean_reversion=player_mean_reversion,
+            initial_totals=initial_totals,
+            round_fractions=round_fractions,
+            round_numbers=round_numbers,
+        )
+
+    @staticmethod
+    def _build_in_play_conditioning_context(
+        players: list[_PlayerRecord],
+        total_rounds: int = 4,
+        enable: bool = True,
+    ) -> _InPlayConditioningResult:
+        n_players = len(players)
+        zero_totals = np.zeros(n_players, dtype=np.float64)
+        default_fractions = np.ones(total_rounds, dtype=np.float64)
+        default_numbers = np.arange(1, total_rounds + 1, dtype=np.int16)
+
+        if not enable or n_players == 0:
+            return _InPlayConditioningResult(
+                applied=False,
+                note="In-play conditioning disabled.",
+                initial_totals=zero_totals,
+                round_fractions=default_fractions,
+                round_numbers=default_numbers,
+            )
+
+        initial_totals = np.zeros(n_players, dtype=np.float64)
+        have_live_scores = np.zeros(n_players, dtype=bool)
+        nonzero_score = False
+        has_round_data = False
+        has_thru_data = False
+        completed_round_estimates: list[int] = []
+        thru_in_progress_holes: list[int] = []
+
+        for idx, player in enumerate(players):
+            score = player.current_score_to_par
+            if score is not None and np.isfinite(score):
+                initial_totals[idx] = float(score)
+                have_live_scores[idx] = True
+                if abs(float(score)) > 1e-8:
+                    nonzero_score = True
+
+            thru_holes = _thru_to_hole_count(player.current_thru)
+            if thru_holes is not None:
+                has_thru_data = True
+                if 1 <= thru_holes < 18:
+                    thru_in_progress_holes.append(thru_holes)
+
+            rounds_len = len(player.round_scores)
+            if rounds_len > 0:
+                has_round_data = True
+                if thru_holes is not None and 1 <= thru_holes < 18:
+                    completed_round_estimates.append(max(0, rounds_len - 1))
+                elif thru_holes == 18:
+                    completed_round_estimates.append(rounds_len)
+                else:
+                    completed_round_estimates.append(rounds_len)
+            elif thru_holes == 18 and player.today_score_to_par is not None:
+                # We have evidence the active round is complete even without explicit round list.
+                completed_round_estimates.append(1)
+
+        live_coverage = (
+            float(have_live_scores.mean()) if have_live_scores.size > 0 else 0.0
+        )
+        started_signal = has_round_data or has_thru_data or nonzero_score
+        if live_coverage < 0.15 or not started_signal:
+            return _InPlayConditioningResult(
+                applied=False,
+                note="No reliable in-play signal; using full 4-round pre-event simulation.",
+                initial_totals=zero_totals,
+                round_fractions=default_fractions,
+                round_numbers=default_numbers,
+            )
+
+        completed_rounds = (
+            int(np.median(completed_round_estimates)) if completed_round_estimates else 0
+        )
+        completed_rounds = int(np.clip(completed_rounds, 0, total_rounds))
+
+        round_fractions: list[float] = []
+        round_numbers: list[int] = []
+        in_progress = bool(thru_in_progress_holes) and completed_rounds < total_rounds
+
+        if in_progress:
+            current_round_number = min(total_rounds, completed_rounds + 1)
+            median_thru = float(np.median(thru_in_progress_holes))
+            fraction_remaining = np.clip((18.0 - median_thru) / 18.0, 0.0, 1.0)
+            if fraction_remaining > 1e-3:
+                round_fractions.append(float(fraction_remaining))
+                round_numbers.append(current_round_number)
+            next_round = current_round_number + 1
+        else:
+            next_round = completed_rounds + 1
+
+        for round_number in range(next_round, total_rounds + 1):
+            round_fractions.append(1.0)
+            round_numbers.append(round_number)
+
+        if completed_rounds >= total_rounds and not in_progress:
+            note = (
+                "Live event appears complete; probabilities are conditioned on current scores only."
+            )
+            return _InPlayConditioningResult(
+                applied=True,
+                note=note,
+                initial_totals=initial_totals,
+                round_fractions=np.zeros(0, dtype=np.float64),
+                round_numbers=np.zeros(0, dtype=np.int16),
+            )
+
+        if not round_fractions:
+            return _InPlayConditioningResult(
+                applied=False,
+                note="Unable to infer reliable rounds remaining from live feed.",
+                initial_totals=zero_totals,
+                round_fractions=default_fractions,
+                round_numbers=default_numbers,
+            )
+
+        note = (
+            "In-play conditioning applied from live leaderboard state: "
+            f"coverage={live_coverage:.0%}, completed_rounds={completed_rounds}, "
+            f"remaining_steps={len(round_fractions)}."
+        )
+        return _InPlayConditioningResult(
+            applied=True,
+            note=note,
+            initial_totals=initial_totals,
+            round_fractions=np.asarray(round_fractions, dtype=np.float64),
+            round_numbers=np.asarray(round_numbers, dtype=np.int16),
         )
 
 
@@ -1030,6 +1241,20 @@ def _normalize_thru_value(value: Any) -> str | None:
     if digit_match:
         return digit_match.group(0)
     return text
+
+
+def _thru_to_hole_count(value: Any) -> int | None:
+    normalized = _normalize_thru_value(value)
+    if normalized is None:
+        return None
+    text = normalized.strip().upper()
+    if text in {"F", "FINAL"}:
+        return 18
+    if text.isdigit():
+        holes = int(text)
+        if 0 <= holes <= 18:
+            return holes
+    return None
 
 
 def _numeric_from_payload(payload: Any, keys: tuple[str, ...]) -> float | None:
