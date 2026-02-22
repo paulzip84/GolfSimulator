@@ -4,11 +4,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
+from .auth import AuthConfigurationError, RequestAuthenticator
 from .config import get_settings
 from .datagolf_client import DataGolfAPIError, DataGolfClient
 from .learning import LearningStore
@@ -27,12 +29,14 @@ _settings = get_settings()
 _client = DataGolfClient(_settings)
 _learning_store = LearningStore(_settings.learning_database_path)
 _service = SimulationService(_client, learning_store=_learning_store)
+_authenticator = RequestAuthenticator(_settings)
 _web_dir = Path(__file__).resolve().parent / "web"
 _assets_dir = _web_dir / "assets"
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    _authenticator.validate_configuration()
     try:
         yield
     finally:
@@ -50,6 +54,25 @@ if _assets_dir.exists():
     app.mount("/assets", StaticFiles(directory=_assets_dir), name="assets")
 
 
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    try:
+        _authenticator.authenticate_request(request)
+    except AuthConfigurationError as exc:
+        return JSONResponse(status_code=500, content={"detail": str(exc)})
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=exc.headers or None,
+        )
+    return await call_next(request)
+
+
+def require_learning_admin(request: Request) -> None:
+    _authenticator.require_role(request, "admin")
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -62,6 +85,18 @@ async def web_app() -> FileResponse:
     if not index_html.exists():
         raise HTTPException(status_code=503, detail="Web UI assets not found.")
     return FileResponse(index_html)
+
+
+@app.get("/auth/me")
+async def auth_me(request: Request) -> dict[str, object]:
+    user = _authenticator.current_user(request)
+    return {
+        "auth_mode": _authenticator.mode,
+        "authenticated": user is not None,
+        "subject": user.subject if user is not None else None,
+        "email": user.email if user is not None else None,
+        "roles": sorted(user.roles) if user is not None else [],
+    }
 
 
 @app.get("/events/upcoming", response_model=list[EventSummary])
@@ -94,7 +129,10 @@ async def learning_status(tour: str = Query(default="pga")) -> LearningStatusRes
 
 
 @app.post("/learning/sync-train", response_model=LearningSyncResponse)
-async def learning_sync_train(request: LearningSyncRequest) -> LearningSyncResponse:
+async def learning_sync_train(
+    request: LearningSyncRequest,
+    _: None = Depends(require_learning_admin),
+) -> LearningSyncResponse:
     try:
         return await _service.sync_learning_and_retrain(
             tour=request.tour,

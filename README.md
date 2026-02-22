@@ -47,6 +47,11 @@ Then set your key in `.env`:
 DATAGOLF_API_KEY=your_key_here
 ```
 
+Authentication defaults to local open access (`APP_AUTH_MODE=none`).
+For shared web deployment:
+- quickest on Render domain: `APP_AUTH_MODE=basic_auth`
+- strongest with SSO/policies: `APP_AUTH_MODE=cloudflare_access` (requires your own domain)
+
 ## 2. Run local GUI (recommended)
 
 Start the server:
@@ -119,11 +124,16 @@ Endpoints:
 - `GET /health`
 - `GET /` (GUI)
 - `GET /ui` (GUI alias)
+- `GET /auth/me`
 - `GET /events/upcoming?tour=pga&limit=12`
 - `POST /simulate`
 - `GET /learning/status?tour=pga`
 - `POST /learning/sync-train`
 - `GET /learning/event-trends?tour=pga&event_id=14`
+
+When auth is enabled:
+- `POST /learning/sync-train` requires `admin` role.
+- All routes except `/health` require authentication by default.
 
 Example request:
 
@@ -173,6 +183,64 @@ curl -X POST "http://127.0.0.1:8000/simulate" \
 - Live probability movement:
   - Enable `Live Auto-Refresh` in the GUI to rerun in-play conditioned simulations on a cadence.
   - Expanded player rows show win-probability trend snapshots and deltas over the tournament.
+
+## Secure web deployment (recommended)
+
+Deploying for friends is easiest with:
+- Render (host FastAPI app)
+- Basic Auth (works immediately on Render-provided domain)
+- optional upgrade: Cloudflare Access (authentication + policy control)
+
+### Render
+
+1. Create a Python web service from this repo.
+2. Build command:
+   - `pip install --upgrade pip && pip install .`
+3. Start command:
+   - `uvicorn pga_sim.api:app --host 0.0.0.0 --port $PORT`
+4. Set env vars:
+   - `DATAGOLF_API_KEY=...`
+   - `LEARNING_DATABASE_PATH=/var/data/pga_sim_learning.sqlite3` (if using persistent disk)
+   - `APP_AUTH_MODE=basic_auth`
+   - `APP_AUTH_BASIC_USERNAME=<your-username>`
+   - `APP_AUTH_BASIC_PASSWORD=<long-random-password>`
+   - `APP_AUTH_BASIC_ROLE=admin`
+
+### Basic Auth quick start (no custom domain required)
+
+Use your Render URL directly (example `https://golfsimulator.onrender.com`) with:
+- `APP_AUTH_MODE=basic_auth`
+- `APP_AUTH_BASIC_USERNAME=<username>`
+- `APP_AUTH_BASIC_PASSWORD=<long-random-password>`
+- `APP_AUTH_BASIC_ROLE=admin` (or `user`)
+
+Browser requests will prompt for username/password and the GUI/API will stay protected.
+
+### Optional upgrade: Cloudflare Access (requires custom domain)
+
+If you want IdP-backed auth, per-user policies, and easier user revocation:
+- Add a custom domain in Render.
+- Put it behind Cloudflare DNS + Access.
+- Then set:
+   - `APP_AUTH_MODE=cloudflare_access`
+   - `CLOUDFLARE_ACCESS_TEAM_DOMAIN=your-team.cloudflareaccess.com`
+   - `CLOUDFLARE_ACCESS_AUDIENCE=<cloudflare-access-aud-tag>`
+   - `AUTH_ALLOWED_EMAILS=friend1@email.com,friend2@email.com` (optional allowlist)
+   - `AUTH_ALLOWED_EMAIL_DOMAINS=yourdomain.com` (optional domain allowlist)
+   - `AUTH_ADMIN_EMAILS=you@email.com` (admin actions like retrain)
+
+### Quick fallback: shared bearer token
+
+If you want a simpler temporary setup:
+- `APP_AUTH_MODE=shared_token`
+- `APP_AUTH_SHARED_TOKEN=<long-random-token>`
+- `APP_AUTH_SHARED_TOKEN_ROLE=admin` or `user`
+
+Then clients send:
+
+```bash
+Authorization: Bearer <your-token>
+```
 
 ## Testing
 

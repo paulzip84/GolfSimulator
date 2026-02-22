@@ -9,6 +9,20 @@ class Settings(BaseSettings):
     http_timeout_seconds: float = 20.0
     default_simulations: int = 10_000
     learning_database_path: str = ".pga_sim_learning.sqlite3"
+    app_auth_mode: str = "none"
+    app_auth_exempt_paths: str = "/health"
+    app_auth_shared_token: str = ""
+    app_auth_shared_token_role: str = "admin"
+    app_auth_basic_username: str = ""
+    app_auth_basic_password: str = ""
+    app_auth_basic_role: str = "admin"
+    auth_allowed_emails: str = ""
+    auth_allowed_email_domains: str = ""
+    auth_admin_emails: str = ""
+    auth_admin_email_domains: str = ""
+    auth_admin_subjects: str = ""
+    cloudflare_access_team_domain: str = ""
+    cloudflare_access_audience: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",

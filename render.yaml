@@ -25,9 +25,15 @@ services:
       - key: LEARNING_DATABASE_PATH
         value: /var/data/pga_sim_learning.sqlite3
       - key: APP_AUTH_MODE
-        value: cloudflare_access
+        value: basic_auth
       - key: APP_AUTH_EXEMPT_PATHS
         value: /health
+      - key: APP_AUTH_BASIC_USERNAME
+        sync: false
+      - key: APP_AUTH_BASIC_PASSWORD
+        sync: false
+      - key: APP_AUTH_BASIC_ROLE
+        value: admin
       - key: APP_AUTH_SHARED_TOKEN
         sync: false
       - key: APP_AUTH_SHARED_TOKEN_ROLE
