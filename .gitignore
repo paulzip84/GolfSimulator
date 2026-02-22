@@ -5,3 +5,6 @@ __pycache__/
 .env
 build/
 *.egg-info/
+.pga_sim_learning.sqlite3
+.pga_sim_learning.sqlite3-shm
+.pga_sim_learning.sqlite3-wal

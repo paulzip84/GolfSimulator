@@ -50,6 +50,19 @@
           </label>
 
           <label class="field">
+            <span>Live Auto-Refresh</span>
+            <select id="liveAutoRefreshSelect">
+              <option value="no" selected>No</option>
+              <option value="yes">Yes</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Refresh Seconds</span>
+            <input id="liveRefreshSecondsInput" type="number" min="15" max="900" step="5" value="60" />
+          </label>
+
+          <label class="field">
             <span>Cut Size</span>
             <input id="cutSizeInput" type="number" min="20" max="156" value="70" />
           </label>
@@ -187,6 +200,12 @@
         <div class="action-row">
           <button id="loadEventsButton" class="btn btn-secondary" type="button">Refresh Events</button>
           <button id="simulateButton" class="btn btn-primary" type="button">Run Simulation</button>
+          <button id="syncLearningButton" class="btn btn-secondary" type="button">
+            Sync Outcomes + Retrain
+          </button>
+          <button id="refreshLearningButton" class="btn btn-secondary" type="button">
+            Refresh Learning
+          </button>
           <button
             id="applyRecommendationButton"
             class="btn btn-secondary"
@@ -199,6 +218,7 @@
 
         <p id="status" class="status idle">Ready.</p>
         <p id="formStatus" class="status idle"></p>
+        <p id="learningStatus" class="status idle">Learning calibration: not trained yet.</p>
         <p id="error" class="error" hidden></p>
       </section>
 
@@ -224,6 +244,10 @@
             <h2>Season Window</h2>
             <p id="seasonWindowLabel">-</p>
           </article>
+          <article class="metric">
+            <h2>Calibration</h2>
+            <p id="calibrationLabel">-</p>
+          </article>
         </div>
 
         <div class="chart-wrap">
@@ -242,9 +266,11 @@
                 <th data-col="today_score_to_par">Today</th>
                 <th data-col="current_thru">Thru</th>
                 <th data-col="win_probability">Win %</th>
-                <th data-col="top_3_probability">Top 3 %</th>
-                <th data-col="top_5_probability">Top 5 %</th>
-                <th data-col="top_10_probability">Top 10 %</th>
+                <th data-col="win_delta_prev">Win Δ Prev</th>
+                <th data-col="win_delta_start">Win Δ Start</th>
+                <th data-col="top_3_probability">Top 3 (Place) %</th>
+                <th data-col="top_5_probability">Top 5 (Place) %</th>
+                <th data-col="top_10_probability">Top 10 (Place) %</th>
                 <th data-col="mean_finish">Avg Finish</th>
                 <th data-col="baseline_win_probability">Baseline Win %</th>
                 <th data-col="baseline_season_metric">Baseline Season</th>

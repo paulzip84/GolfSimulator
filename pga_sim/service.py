@@ -10,7 +10,17 @@ from typing import Any
 import numpy as np
 
 from .datagolf_client import DataGolfAPIError, DataGolfClient
-from .models import EventSummary, PlayerSimulationOutput, SimulationRequest, SimulationResponse
+from .learning import CalibrationMetrics, LearningStore
+from .models import (
+    CalibrationMarketStatus,
+    EventSummary,
+    LearningEventTrendsResponse,
+    LearningStatusResponse,
+    LearningSyncResponse,
+    PlayerSimulationOutput,
+    SimulationRequest,
+    SimulationResponse,
+)
 from .simulation import HybridMarkovSimulator, MarkovSimulationConfig, SimulationInputs
 
 _ID_KEYS = ("dg_id", "player_id", "id", "player")
@@ -54,11 +64,25 @@ _LIVE_POSITION_KEYS = (
 )
 _LIVE_SCORE_TO_PAR_KEYS = (
     "score_to_par",
-    "to_par",
     "total_to_par",
-    "tot",
+    "total_score_to_par",
+    "event_score_to_par",
+    "tournament_score_to_par",
+    "event_to_par",
+    "overall_score_to_par",
     "overall_to_par",
     "cum_to_par",
+)
+_LIVE_SCORE_TO_PAR_FALLBACK_KEYS = ("to_par", "tot")
+_LIVE_SCORE_NESTED_CONTAINERS = (
+    "status",
+    "leaderboard",
+    "scoring",
+    "live",
+    "current",
+    "event",
+    "tournament",
+    "totals",
 )
 _LIVE_THRU_KEYS = (
     "thru",
@@ -120,12 +144,19 @@ class _PlayerRecord:
     baseline_top_5_probability: float | None = None
     baseline_top_10_probability: float | None = None
     baseline_season_metric: float | None = None
+    baseline_phase_metric: float | None = None
     current_season_metric: float | None = None
+    current_recent_metric: float | None = None
+    current_recent_finish_score: float | None = None
     form_delta_metric: float | None = None
     baseline_season_rounds: int = 0
     current_season_rounds: int = 0
+    baseline_season_starts: int = 0
+    current_season_starts: int = 0
     baseline_season_volatility: float | None = None
     current_season_volatility: float | None = None
+    baseline_hot_streak_score: float | None = None
+    dynamic_current_weight: float | None = None
     current_position: str | None = None
     current_score_to_par: float | None = None
     current_thru: str | None = None
@@ -151,6 +182,7 @@ class _SeasonLoadResult:
     successful_event_count: int
     player_metric_count: int
     observation_count: int
+    season_phase_hint: float | None = None
     from_cache: bool = False
 
 
@@ -164,8 +196,9 @@ class _InPlayConditioningResult:
 
 
 class SimulationService:
-    def __init__(self, datagolf: DataGolfClient):
+    def __init__(self, datagolf: DataGolfClient, learning_store: LearningStore | None = None):
         self._datagolf = datagolf
+        self._learning = learning_store
         self._season_metrics_cache: dict[tuple[str, int], _SeasonLoadResult] = {}
 
     async def list_upcoming_events(self, tour: str = "pga", limit: int = 12) -> list[EventSummary]:
@@ -267,6 +300,12 @@ class SimulationService:
                 f"feeds. Active event: {active_event_name} (event_id={active_event_id})."
             )
 
+        event_date = (
+            _string_from_payload(field_payload, _DATE_KEYS)
+            or _string_from_payload(pre_payload, _DATE_KEYS)
+        )
+        season_phase = _season_phase_from_date(event_date)
+
         field_rows = _extract_rows(field_payload, ("field", "player"))
         live_rows = _extract_rows(live_payload, ("in-play", "player", "pred"))
         pre_rows = _extract_rows(pre_payload, ("pred", "tournament", "player"))
@@ -300,6 +339,11 @@ class SimulationService:
                     players=players,
                     baseline_metrics=baseline_metrics,
                     current_metrics=current_metrics,
+                    season_phase=(
+                        season_phase
+                        if season_phase is not None
+                        else current_result.season_phase_hint
+                    ),
                 )
                 form_adjustment_applied = applied_count > 0
                 summary = (
@@ -308,7 +352,8 @@ class SimulationService:
                     f"({baseline_result.successful_event_count}/{baseline_result.event_count} events), "
                     f"current {current_season} -> {current_result.player_metric_count} players "
                     f"({current_result.successful_event_count}/{current_result.event_count} events). "
-                    f"Matched active field players: {applied_count}."
+                    f"Matched active field players: {applied_count}. "
+                    f"Season phase={((season_phase if season_phase is not None else current_result.season_phase_hint) or 0.5):.2f}."
                 )
                 if form_adjustment_applied:
                     form_adjustment_note = summary
@@ -364,7 +409,73 @@ class SimulationService:
             ci_top_n=request.ci_top_n,
         )
 
-        rankings = np.argsort(outputs.win_probability)[::-1]
+        event_id = (
+            request.event_id
+            or _string_from_payload(field_payload, _EVENT_ID_KEYS)
+            or _string_from_payload(pre_payload, _EVENT_ID_KEYS)
+        )
+        event_name = (
+            _string_from_payload(field_payload, _EVENT_NAME_KEYS)
+            or _string_from_payload(pre_payload, _EVENT_NAME_KEYS)
+        )
+
+        raw_win_probability = outputs.win_probability.astype(np.float64, copy=True)
+        raw_top_3_probability = outputs.top_3_probability.astype(np.float64, copy=True)
+        raw_top_5_probability = outputs.top_5_probability.astype(np.float64, copy=True)
+        raw_top_10_probability = outputs.top_10_probability.astype(np.float64, copy=True)
+
+        display_win_probability = raw_win_probability
+        display_top_3_probability = raw_top_3_probability
+        display_top_5_probability = raw_top_5_probability
+        display_top_10_probability = raw_top_10_probability
+
+        calibration_applied = False
+        calibration_version = 0
+        calibration_note = "Learning calibration not configured."
+        if self._learning is not None:
+            snapshot = self._learning.get_snapshot(tour=request.tour)
+            calibration_version = snapshot.version
+            if snapshot.version > 0 and snapshot.markets:
+                display_win_probability = snapshot.apply("win", raw_win_probability)
+                win_total = float(display_win_probability.sum())
+                if win_total > 1e-12:
+                    display_win_probability = display_win_probability / win_total
+                else:
+                    display_win_probability = raw_win_probability
+
+                display_top_3_probability = snapshot.apply("top_3", raw_top_3_probability)
+                display_top_5_probability = snapshot.apply("top_5", raw_top_5_probability)
+                display_top_10_probability = snapshot.apply("top_10", raw_top_10_probability)
+
+                display_top_3_probability = np.maximum(
+                    display_top_3_probability,
+                    display_win_probability,
+                )
+                display_top_5_probability = np.maximum(
+                    display_top_5_probability,
+                    display_top_3_probability,
+                )
+                display_top_10_probability = np.maximum(
+                    display_top_10_probability,
+                    display_top_5_probability,
+                )
+                display_top_3_probability = np.clip(display_top_3_probability, 0.0, 1.0)
+                display_top_5_probability = np.clip(display_top_5_probability, 0.0, 1.0)
+                display_top_10_probability = np.clip(display_top_10_probability, 0.0, 1.0)
+                calibration_applied = True
+                calibration_note = (
+                    f"Applied learning calibration v{snapshot.version} from historical outcomes."
+                )
+            elif snapshot.version <= 0:
+                calibration_note = (
+                    "Learning calibration is not trained yet. Run outcome sync + retrain."
+                )
+            else:
+                calibration_note = (
+                    "Learning calibration loaded, but no per-market parameters were available."
+                )
+
+        rankings = np.argsort(display_win_probability)[::-1]
         result_rows: list[PlayerSimulationOutput] = []
         for idx in rankings:
             record = players[idx]
@@ -372,10 +483,10 @@ class SimulationService:
                 PlayerSimulationOutput(
                     player_id=record.player_id,
                     player_name=record.player_name,
-                    win_probability=float(outputs.win_probability[idx]),
-                    top_3_probability=float(outputs.top_3_probability[idx]),
-                    top_5_probability=float(outputs.top_5_probability[idx]),
-                    top_10_probability=float(outputs.top_10_probability[idx]),
+                    win_probability=float(display_win_probability[idx]),
+                    top_3_probability=float(display_top_3_probability[idx]),
+                    top_5_probability=float(display_top_5_probability[idx]),
+                    top_10_probability=float(display_top_10_probability[idx]),
                     mean_finish=float(outputs.mean_finish[idx]),
                     mean_total_relative_to_field=float(
                         outputs.mean_total_relative_to_field[idx]
@@ -398,18 +509,11 @@ class SimulationService:
                 )
             )
 
-        return SimulationResponse(
+        response = SimulationResponse(
             generated_at=datetime.now(timezone.utc),
             tour=request.tour,
-            event_id=(
-                request.event_id
-                or _string_from_payload(field_payload, _EVENT_ID_KEYS)
-                or _string_from_payload(pre_payload, _EVENT_ID_KEYS)
-            ),
-            event_name=(
-                _string_from_payload(field_payload, _EVENT_NAME_KEYS)
-                or _string_from_payload(pre_payload, _EVENT_NAME_KEYS)
-            ),
+            event_id=event_id,
+            event_name=event_name,
             simulations=outputs.simulations_run,
             requested_simulations=request.simulations,
             adaptive_stopped_early=outputs.adaptive_stopped_early,
@@ -423,8 +527,224 @@ class SimulationService:
             current_season=current_season if request.enable_seasonal_form else None,
             form_adjustment_applied=form_adjustment_applied,
             form_adjustment_note=form_adjustment_note,
+            calibration_applied=calibration_applied,
+            calibration_version=calibration_version,
+            calibration_note=calibration_note,
             players=result_rows,
         )
+        self._record_learning_prediction(
+            request=request,
+            response=response,
+            players=players,
+            raw_win_probability=raw_win_probability,
+            raw_top_3_probability=raw_top_3_probability,
+            raw_top_5_probability=raw_top_5_probability,
+            raw_top_10_probability=raw_top_10_probability,
+            event_date=event_date,
+            in_play_applied=in_play_context.applied,
+        )
+        return response
+
+    async def get_learning_status(self, tour: str = "pga") -> LearningStatusResponse:
+        if self._learning is None:
+            return LearningStatusResponse(tour=tour.strip().lower())
+        status = self._learning.status(tour=tour)
+        return LearningStatusResponse(
+            tour=status["tour"],
+            predictions_logged=int(status["predictions_logged"]),
+            resolved_predictions=int(status["resolved_predictions"]),
+            resolved_events=int(status["resolved_events"]),
+            pending_events=int(status["pending_events"]),
+            calibration_version=int(status["calibration_version"]),
+            calibration_updated_at=status["calibration_updated_at"],
+            markets=self._market_status_models(status["markets"]),
+        )
+
+    async def get_learning_event_trends(
+        self,
+        *,
+        tour: str = "pga",
+        event_id: str,
+        event_year: int | None = None,
+        max_snapshots: int = 80,
+        max_players: int = 40,
+    ) -> LearningEventTrendsResponse:
+        if self._learning is None:
+            raise ValueError("Learning store is not configured.")
+        payload = self._learning.event_trends(
+            tour=tour,
+            event_id=event_id,
+            event_year=event_year,
+            max_snapshots=max_snapshots,
+            max_players=max_players,
+        )
+        return LearningEventTrendsResponse(**payload)
+
+    async def sync_learning_and_retrain(
+        self,
+        tour: str = "pga",
+        max_events: int = 40,
+    ) -> LearningSyncResponse:
+        if self._learning is None:
+            raise ValueError("Learning store is not configured.")
+
+        baseline_snapshot = self._learning.get_snapshot(tour=tour)
+        baseline_status = self._learning.status(tour=tour)
+        pending_events = self._learning.list_pending_events(tour=tour, max_events=max_events)
+        processed_event_ids: list[str] = []
+        awaiting_outcomes_event_ids: list[str] = []
+        outcomes_fetched = 0
+
+        def event_label(event: Any) -> str:
+            name = str(event.event_name).strip() if getattr(event, "event_name", None) else ""
+            base = f"{event.event_id}:{event.event_year}"
+            return f"{name} ({base})" if name else base
+
+        for event in pending_events:
+            try:
+                payload = await self._datagolf.get_historical_event(
+                    tour=event.tour,
+                    event_id=event.event_id,
+                    year=event.event_year,
+                )
+            except DataGolfAPIError:
+                awaiting_outcomes_event_ids.append(event_label(event))
+                continue
+            outcome_rows = self._learning.record_outcome_payload(
+                tour=event.tour,
+                event_id=event.event_id,
+                event_year=event.event_year,
+                payload=payload,
+            )
+            if outcome_rows > 0:
+                outcomes_fetched += 1
+                processed_event_ids.append(f"{event.event_id}:{event.event_year}")
+            else:
+                awaiting_outcomes_event_ids.append(event_label(event))
+
+        retrain_executed = False
+        should_retrain = outcomes_fetched > 0 or (
+            int(baseline_snapshot.version) <= 0
+            and int(baseline_status.get("resolved_predictions") or 0) > 0
+        )
+        if should_retrain:
+            self._learning.retrain(tour=tour, bump_version=True)
+            retrain_executed = True
+
+        status = self._learning.status(tour=tour)
+        current_version = int(status["calibration_version"])
+        previous_version = int(baseline_snapshot.version)
+
+        note_parts: list[str] = []
+        if outcomes_fetched > 0:
+            note_parts.append(f"Fetched outcomes for {outcomes_fetched} events.")
+        else:
+            note_parts.append("No new outcomes fetched.")
+
+        if awaiting_outcomes_event_ids:
+            preview = ", ".join(awaiting_outcomes_event_ids[:4])
+            if len(awaiting_outcomes_event_ids) > 4:
+                preview += ", ..."
+            note_parts.append(
+                "Awaiting official historical outcomes for "
+                f"{len(awaiting_outcomes_event_ids)} event(s): {preview}"
+            )
+
+        if retrain_executed and current_version > previous_version:
+            note_parts.append(
+                f"Retrain complete: Learning v{previous_version} -> v{current_version}."
+            )
+        elif retrain_executed:
+            note_parts.append(
+                f"Retrain ran with existing calibration version v{current_version}."
+            )
+        else:
+            note_parts.append(
+                f"Retrain skipped: Learning version remains v{current_version} (no new resolved outcomes)."
+            )
+        note = " ".join(note_parts)
+
+        return LearningSyncResponse(
+            tour=status["tour"],
+            predictions_logged=int(status["predictions_logged"]),
+            resolved_predictions=int(status["resolved_predictions"]),
+            resolved_events=int(status["resolved_events"]),
+            pending_events=int(status["pending_events"]),
+            calibration_version=int(status["calibration_version"]),
+            calibration_updated_at=status["calibration_updated_at"],
+            markets=self._market_status_models(status["markets"]),
+            outcomes_fetched=outcomes_fetched,
+            events_processed=len(pending_events),
+            event_ids_processed=processed_event_ids,
+            awaiting_outcomes_count=len(awaiting_outcomes_event_ids),
+            awaiting_outcomes_event_ids=awaiting_outcomes_event_ids,
+            retrain_executed=retrain_executed,
+            sync_note=note,
+        )
+
+    @staticmethod
+    def _market_status_models(
+        metrics: list[CalibrationMetrics],
+    ) -> list[CalibrationMarketStatus]:
+        out: list[CalibrationMarketStatus] = []
+        for metric in metrics:
+            out.append(
+                CalibrationMarketStatus(
+                    market=metric.market,
+                    alpha=metric.alpha,
+                    beta=metric.beta,
+                    samples=metric.samples,
+                    positives=metric.positives,
+                    brier_before=metric.brier_before,
+                    brier_after=metric.brier_after,
+                    logloss_before=metric.logloss_before,
+                    logloss_after=metric.logloss_after,
+                )
+            )
+        return out
+
+    def _record_learning_prediction(
+        self,
+        *,
+        request: SimulationRequest,
+        response: SimulationResponse,
+        players: list[_PlayerRecord],
+        raw_win_probability: np.ndarray,
+        raw_top_3_probability: np.ndarray,
+        raw_top_5_probability: np.ndarray,
+        raw_top_10_probability: np.ndarray,
+        event_date: str | None,
+        in_play_applied: bool,
+    ) -> None:
+        if self._learning is None:
+            return
+        try:
+            player_rows: list[dict[str, Any]] = []
+            for idx, record in enumerate(players):
+                player_rows.append(
+                    {
+                        "player_id": record.player_id,
+                        "player_name": record.player_name,
+                        "win_probability": float(raw_win_probability[idx]),
+                        "top_3_probability": float(raw_top_3_probability[idx]),
+                        "top_5_probability": float(raw_top_5_probability[idx]),
+                        "top_10_probability": float(raw_top_10_probability[idx]),
+                    }
+                )
+            self._learning.record_prediction(
+                tour=response.tour,
+                event_id=response.event_id,
+                event_name=response.event_name,
+                event_date=event_date,
+                requested_simulations=response.requested_simulations,
+                simulations=response.simulations,
+                enable_in_play=request.enable_in_play_conditioning,
+                in_play_applied=in_play_applied,
+                players=player_rows,
+            )
+        except Exception:
+            # Never block simulation responses on local learning persistence.
+            return
 
     def _merge_player_records(
         self,
@@ -528,7 +848,9 @@ class SimulationService:
             if row_sigma is not None:
                 record.sigma = row_sigma
 
-        return list(merged.values())
+        records = list(merged.values())
+        _reconcile_merged_live_scores(records)
+        return records
 
     @staticmethod
     def _resolve_season_window(request: SimulationRequest) -> tuple[int, int]:
@@ -558,12 +880,13 @@ class SimulationService:
                 successful_event_count=cached.successful_event_count,
                 player_metric_count=cached.player_metric_count,
                 observation_count=cached.observation_count,
+                season_phase_hint=cached.season_phase_hint,
                 from_cache=True,
             )
 
         event_list_payload = await self._datagolf.get_historical_event_list(tour=tour)
-        event_descriptors = _historical_event_descriptors(event_list_payload, season=season)
-        if not event_descriptors:
+        event_records = _historical_event_records(event_list_payload, season=season)
+        if not event_records:
             raise DataGolfAPIError(
                 f"No historical events found for tour={tour}, season={season}."
             )
@@ -578,20 +901,28 @@ class SimulationService:
                     year=year,
                 )
 
-        payload_tasks = [fetch_event(event_id, year) for event_id, year in event_descriptors]
+        payload_tasks = [
+            fetch_event(str(event["event_id"]), int(event["year"])) for event in event_records
+        ]
         payloads = await asyncio.gather(*payload_tasks, return_exceptions=True)
 
         per_player: dict[str, dict[str, Any]] = {}
         successful_events = 0
         total_observations = 0
-        for payload in payloads:
+        latest_event_phase = 0.5
+
+        for event_record, payload in zip(event_records, payloads):
             if isinstance(payload, Exception):
                 continue
-
+            event_phase = _to_float(event_record.get("phase")) or 0.5
+            latest_event_phase = event_phase
             observations = _extract_player_metric_observations(payload)
-            if observations:
+            event_features = _extract_player_event_features(payload, event_phase=event_phase)
+            if observations or event_features:
                 successful_events += 1
             total_observations += len(observations)
+
+            grouped_event_observations: dict[str, dict[str, Any]] = {}
             for canonical_key, player_id, player_name, metric in observations:
                 bucket = per_player.setdefault(
                     canonical_key,
@@ -599,21 +930,133 @@ class SimulationService:
                         "player_id": player_id,
                         "player_name": player_name,
                         "metrics": [],
+                        "event_metrics": [],
+                        "event_phases": [],
+                        "finish_scores": [],
+                        "win_phases": [],
+                        "starts": 0,
+                        "wins": 0,
+                        "top10": 0,
                     },
                 )
                 bucket["metrics"].append(metric)
+                grouped = grouped_event_observations.setdefault(
+                    canonical_key,
+                    {
+                        "player_id": player_id,
+                        "player_name": player_name,
+                        "metrics": [],
+                    },
+                )
+                grouped["metrics"].append(metric)
+
+            if event_features:
+                for feature in event_features:
+                    canonical_key = str(feature["canonical_key"])
+                    player_id = str(feature.get("player_id") or "")
+                    player_name = str(feature.get("player_name") or "")
+                    metric = _to_float(feature.get("metric"))
+                    if metric is None:
+                        continue
+                    bucket = per_player.setdefault(
+                        canonical_key,
+                        {
+                            "player_id": player_id,
+                            "player_name": player_name,
+                            "metrics": [],
+                            "event_metrics": [],
+                            "event_phases": [],
+                            "finish_scores": [],
+                            "win_phases": [],
+                            "starts": 0,
+                            "wins": 0,
+                            "top10": 0,
+                        },
+                    )
+                    if bucket.get("player_id") in (None, "") and player_id:
+                        bucket["player_id"] = player_id
+                    if bucket.get("player_name") in (None, "") and player_name:
+                        bucket["player_name"] = player_name
+
+                    bucket["event_metrics"].append(float(metric))
+                    bucket["event_phases"].append(float(event_phase))
+                    bucket["starts"] += 1
+                    finish_rank = _to_float(feature.get("finish_rank"))
+                    finish_score = _finish_score_from_rank(finish_rank)
+                    if finish_score is not None:
+                        bucket["finish_scores"].append(float(finish_score))
+                    won = bool(feature.get("won"))
+                    top10 = bool(feature.get("top10"))
+                    if won:
+                        bucket["wins"] += 1
+                        bucket["win_phases"].append(float(event_phase))
+                    if top10:
+                        bucket["top10"] += 1
+            else:
+                # Fallback for round-only payloads: synthesize one event-level datapoint per player.
+                for canonical_key, grouped in grouped_event_observations.items():
+                    metrics = grouped.get("metrics") or []
+                    if not metrics:
+                        continue
+                    metric = float(np.mean(np.asarray(metrics, dtype=np.float64)))
+                    bucket = per_player.setdefault(
+                        canonical_key,
+                        {
+                            "player_id": grouped.get("player_id"),
+                            "player_name": grouped.get("player_name"),
+                            "metrics": [],
+                            "event_metrics": [],
+                            "event_phases": [],
+                            "finish_scores": [],
+                            "win_phases": [],
+                            "starts": 0,
+                            "wins": 0,
+                            "top10": 0,
+                        },
+                    )
+                    bucket["event_metrics"].append(metric)
+                    bucket["event_phases"].append(float(event_phase))
+                    bucket["starts"] += 1
 
         out: dict[str, dict[str, Any]] = {}
         for key, values in per_player.items():
             metrics = np.asarray(values["metrics"], dtype=np.float64)
-            if metrics.size == 0:
+            event_metrics = np.asarray(values.get("event_metrics") or [], dtype=np.float64)
+            event_phases = np.asarray(values.get("event_phases") or [], dtype=np.float64)
+            finish_scores = np.asarray(values.get("finish_scores") or [], dtype=np.float64)
+            win_phases = np.asarray(values.get("win_phases") or [], dtype=np.float64)
+
+            metric_source = event_metrics if event_metrics.size > 0 else metrics
+            if metric_source.size == 0:
                 continue
+            starts = int(values.get("starts") or 0)
+            if starts <= 0 and event_metrics.size > 0:
+                starts = int(event_metrics.size)
+            if starts <= 0:
+                starts = 0
+
+            recent_metric = _ewma(metric_source.tolist(), alpha=0.55)
+            recent_finish_score = _ewma(finish_scores.tolist(), alpha=0.60)
+            hot_streak_score = _hot_streak_score(win_phases.tolist())
             out[key] = {
                 "player_id": values.get("player_id"),
                 "player_name": values.get("player_name"),
-                "metric": float(metrics.mean()),
-                "rounds": int(metrics.size),
-                "volatility": float(metrics.std(ddof=1)) if metrics.size > 1 else None,
+                "metric": float(metric_source.mean()),
+                "rounds": int(metrics.size) if metrics.size > 0 else int(metric_source.size),
+                "starts": starts,
+                "wins": int(values.get("wins") or 0),
+                "top10": int(values.get("top10") or 0),
+                "volatility": (
+                    float(metric_source.std(ddof=1))
+                    if metric_source.size > 1
+                    else None
+                ),
+                "recent_metric": recent_metric,
+                "recent_finish_score": recent_finish_score,
+                "hot_streak_score": hot_streak_score,
+                "event_metrics": [float(v) for v in event_metrics.tolist()],
+                "event_phases": [float(v) for v in event_phases.tolist()],
+                "win_phases": [float(v) for v in win_phases.tolist()],
             }
 
         if not out:
@@ -623,10 +1066,11 @@ class SimulationService:
 
         result = _SeasonLoadResult(
             metrics=out,
-            event_count=len(event_descriptors),
+            event_count=len(event_records),
             successful_event_count=successful_events,
             player_metric_count=len(out),
             observation_count=total_observations,
+            season_phase_hint=latest_event_phase,
             from_cache=False,
         )
         self._season_metrics_cache[cache_key] = result
@@ -637,7 +1081,9 @@ class SimulationService:
         players: list[_PlayerRecord],
         baseline_metrics: dict[str, dict[str, Any]],
         current_metrics: dict[str, dict[str, Any]],
+        season_phase: float | None = None,
     ) -> int:
+        phase_value = 0.5 if season_phase is None else float(np.clip(season_phase, 0.0, 1.0))
         baseline_by_name = {
             _normalized_name(str(v.get("player_name"))): v
             for v in baseline_metrics.values()
@@ -657,14 +1103,54 @@ class SimulationService:
             curr = current_metrics.get(id_key) or current_by_name.get(name_key)
 
             if base:
-                player.baseline_season_metric = _to_float(base.get("metric"))
+                baseline_mean_metric = _to_float(base.get("metric"))
+                baseline_phase_metric = _phase_weighted_metric_from_profile(
+                    base,
+                    target_phase=phase_value,
+                    default_value=baseline_mean_metric,
+                )
+                player.baseline_season_metric = baseline_mean_metric
+                player.baseline_phase_metric = baseline_phase_metric
                 player.baseline_season_rounds = int(base.get("rounds") or 0)
+                baseline_starts_value = _to_float(base.get("starts"))
+                if baseline_starts_value is None:
+                    baseline_starts_value = float(player.baseline_season_rounds)
+                player.baseline_season_starts = int(max(0.0, baseline_starts_value))
                 player.baseline_season_volatility = _to_float(base.get("volatility"))
+                player.baseline_hot_streak_score = _to_float(base.get("hot_streak_score"))
             if curr:
                 player.current_season_metric = _to_float(curr.get("metric"))
+                player.current_recent_metric = _to_float(curr.get("recent_metric")) or player.current_season_metric
+                player.current_recent_finish_score = _to_float(curr.get("recent_finish_score"))
                 player.current_season_rounds = int(curr.get("rounds") or 0)
+                current_starts_value = _to_float(curr.get("starts"))
+                if current_starts_value is None:
+                    current_starts_value = float(player.current_season_rounds)
+                player.current_season_starts = int(max(0.0, current_starts_value))
                 player.current_season_volatility = _to_float(curr.get("volatility"))
-            if (
+
+            anchor_metric = (
+                player.baseline_phase_metric
+                if player.baseline_phase_metric is not None
+                else player.baseline_season_metric
+            )
+            current_metric = (
+                player.current_recent_metric
+                if player.current_recent_metric is not None
+                else player.current_season_metric
+            )
+
+            if anchor_metric is not None and current_metric is not None:
+                # Bayesian shrinkage against start count avoids penalizing players with zero starts.
+                starts = float(max(0, player.current_season_starts))
+                tau = 3.5
+                reliability = starts / (starts + tau)
+                posterior_current = (
+                    (reliability * current_metric)
+                    + ((1.0 - reliability) * anchor_metric)
+                )
+                player.form_delta_metric = posterior_current - anchor_metric
+            elif (
                 player.baseline_season_metric is not None
                 and player.current_season_metric is not None
             ):
@@ -711,6 +1197,17 @@ class SimulationService:
                 p.baseline_season_metric
                 if p.baseline_season_metric is not None
                 else np.nan
+            for p in players
+            ],
+            dtype=np.float64,
+        )
+        baseline_phase_metric = np.array(
+            [
+                p.baseline_phase_metric
+                if p.baseline_phase_metric is not None
+                else p.baseline_season_metric
+                if p.baseline_season_metric is not None
+                else np.nan
                 for p in players
             ],
             dtype=np.float64,
@@ -724,51 +1221,121 @@ class SimulationService:
             ],
             dtype=np.float64,
         )
+        current_recent_metric = np.array(
+            [
+                p.current_recent_metric
+                if p.current_recent_metric is not None
+                else p.current_season_metric
+                if p.current_season_metric is not None
+                else np.nan
+                for p in players
+            ],
+            dtype=np.float64,
+        )
         baseline_rounds = np.array(
             [max(0, p.baseline_season_rounds) for p in players], dtype=np.float64
         )
         current_rounds = np.array(
             [max(0, p.current_season_rounds) for p in players], dtype=np.float64
         )
+        baseline_starts = np.array(
+            [max(0, p.baseline_season_starts) for p in players], dtype=np.float64
+        )
+        current_starts = np.array(
+            [max(0, p.current_season_starts) for p in players], dtype=np.float64
+        )
+        recent_finish_score = np.array(
+            [
+                p.current_recent_finish_score
+                if p.current_recent_finish_score is not None
+                else np.nan
+                for p in players
+            ],
+            dtype=np.float64,
+        )
+        baseline_hot_streak = np.array(
+            [
+                p.baseline_hot_streak_score
+                if p.baseline_hot_streak_score is not None
+                else 0.0
+                for p in players
+            ],
+            dtype=np.float64,
+        )
 
         baseline_z = _zscore_with_nan(baseline_metric)
+        baseline_phase_z = _zscore_with_nan(baseline_phase_metric)
         current_z = _zscore_with_nan(current_metric)
+        current_recent_z = _zscore_with_nan(current_recent_metric)
+        recent_finish_z = _zscore_with_nan(recent_finish_score)
 
         has_baseline = ~np.isnan(baseline_z)
         has_current = ~np.isnan(current_z)
+        has_current_recent = ~np.isnan(current_recent_z)
+        has_season_signal = has_baseline | has_current
 
         baseline_signal = np.where(has_baseline, baseline_z, 0.0)
-        current_signal = np.where(has_current, current_z, baseline_signal)
+        baseline_phase_signal = np.where(
+            ~np.isnan(baseline_phase_z),
+            baseline_phase_z,
+            baseline_signal,
+        )
+        current_signal = np.where(has_current, current_z, baseline_phase_signal)
+        current_recent_signal = np.where(
+            has_current_recent,
+            current_recent_z,
+            current_signal,
+        )
 
-        current_reliability = np.clip(current_rounds / 24.0, 0.0, 1.0)
-        baseline_reliability = np.clip(baseline_rounds / 24.0, 0.0, 1.0)
+        current_start_reliability = np.divide(
+            current_starts,
+            current_starts + 3.5,
+            out=np.zeros_like(current_starts, dtype=np.float64),
+            where=(current_starts + 3.5) > 1e-8,
+        )
 
-        current_weight = np.where(
-            has_current,
-            np.clip(current_season_weight, 0.0, 1.0) * current_reliability,
-            0.0,
-        )
-        baseline_weight = np.where(
-            has_baseline,
-            (1.0 - np.clip(current_season_weight, 0.0, 1.0)) * baseline_reliability,
-            0.0,
-        )
-        weight_sum = current_weight + baseline_weight
+        # Phase-specific baseline anchor captures player seasonality from the baseline season.
+        seasonal_anchor = baseline_phase_signal
 
-        weighted_signal = (current_weight * current_signal) + (baseline_weight * baseline_signal)
-        seasonal_anchor = np.divide(
-            weighted_signal,
-            weight_sum,
-            out=np.zeros_like(weight_sum, dtype=np.float64),
-            where=weight_sum > 1e-8,
+        # Bayesian shrinkage prevents zero/low-start players from being unfairly penalized.
+        current_shrunk_signal = (
+            (current_start_reliability * current_recent_signal)
+            + ((1.0 - current_start_reliability) * seasonal_anchor)
         )
-        seasonal_delta = np.where(has_current & has_baseline, current_signal - baseline_signal, 0.0)
-        seasonal_signal = seasonal_anchor + (
-            np.clip(form_delta_weight, 0.0, 1.0) * seasonal_delta
+
+        phase_strength = seasonal_anchor - baseline_signal
+        finish_signal = np.where(~np.isnan(recent_finish_z), recent_finish_z, 0.0)
+        hot_signal = np.where(np.isnan(baseline_hot_streak), 0.0, baseline_hot_streak)
+
+        base_current_weight = float(np.clip(current_season_weight, 0.0, 1.0))
+        base_current_weight = float(np.clip(base_current_weight, 0.02, 0.98))
+        base_logit = np.log(base_current_weight / (1.0 - base_current_weight))
+
+        dynamic_logit = (
+            base_logit
+            + (1.15 * finish_signal)
+            + (0.85 * (current_start_reliability - 0.5))
+            - (0.70 * phase_strength)
+            + (0.45 * hot_signal)
         )
+        dynamic_current_weight = 1.0 / (
+            1.0 + np.exp(-np.clip(dynamic_logit, -8.0, 8.0))
+        )
+        dynamic_current_weight = np.clip(dynamic_current_weight, 0.05, 0.95)
+
+        seasonal_delta = current_shrunk_signal - seasonal_anchor
+        delta_gain = np.clip(form_delta_weight, 0.0, 1.0) * np.sqrt(current_start_reliability)
+        seasonal_signal = (
+            ((1.0 - dynamic_current_weight) * seasonal_anchor)
+            + (dynamic_current_weight * current_shrunk_signal)
+            + (delta_gain * seasonal_delta)
+        )
+
+        for idx, player in enumerate(players):
+            player.dynamic_current_weight = float(dynamic_current_weight[idx])
 
         blended_skill = np.where(
-            weight_sum > 1e-8,
+            has_season_signal,
             (1.0 - np.clip(seasonal_form_weight, 0.0, 1.0)) * normalized_skill
             + np.clip(seasonal_form_weight, 0.0, 1.0) * seasonal_signal,
             normalized_skill,
@@ -802,7 +1369,7 @@ class SimulationService:
             dtype=np.float64,
         )
         volatility_z = _zscore_with_nan(volatility_signal)
-        observation_reliability = np.clip((baseline_rounds + current_rounds) / 30.0, 0.0, 1.0)
+        observation_reliability = np.clip((baseline_starts + current_starts) / 20.0, 0.0, 1.0)
         reversion_adjustment = np.where(~np.isnan(volatility_z), -0.03 * volatility_z, 0.0)
         player_mean_reversion = (
             np.clip(base_mean_reversion, 0.0, 0.6)
@@ -874,7 +1441,8 @@ class SimulationService:
 
             thru_holes = _thru_to_hole_count(player.current_thru)
             if thru_holes is not None:
-                has_thru_data = True
+                if thru_holes > 0:
+                    has_thru_data = True
                 if 1 <= thru_holes < 18:
                     thru_in_progress_holes.append(thru_holes)
 
@@ -895,7 +1463,7 @@ class SimulationService:
             float(have_live_scores.mean()) if have_live_scores.size > 0 else 0.0
         )
         started_signal = has_round_data or has_thru_data or nonzero_score
-        if live_coverage < 0.15 or not started_signal:
+        if not started_signal:
             return _InPlayConditioningResult(
                 applied=False,
                 note="No reliable in-play signal; using full 4-round pre-event simulation.",
@@ -903,6 +1471,15 @@ class SimulationService:
                 round_fractions=default_fractions,
                 round_numbers=default_numbers,
             )
+
+        imputed_player_count = 0
+        if have_live_scores.any():
+            missing_scores = ~have_live_scores
+            imputed_player_count = int(missing_scores.sum())
+            if imputed_player_count > 0:
+                observed_scores = initial_totals[have_live_scores]
+                fill_value = float(np.median(observed_scores))
+                initial_totals[missing_scores] = fill_value
 
         completed_rounds = (
             int(np.median(completed_round_estimates)) if completed_round_estimates else 0
@@ -952,7 +1529,7 @@ class SimulationService:
         note = (
             "In-play conditioning applied from live leaderboard state: "
             f"coverage={live_coverage:.0%}, completed_rounds={completed_rounds}, "
-            f"remaining_steps={len(round_fractions)}."
+            f"remaining_steps={len(round_fractions)}, imputed_players={imputed_player_count}."
         )
         return _InPlayConditioningResult(
             applied=True,
@@ -1076,14 +1653,106 @@ def _season_from_row(row: dict[str, Any]) -> int | None:
 
 
 def _extract_live_score_snapshot(row: dict[str, Any]) -> _LiveScoreSnapshot:
-    return _LiveScoreSnapshot(
-        current_position=_normalize_position_value(_value_from_payload(row, _LIVE_POSITION_KEYS)),
-        current_score_to_par=_score_to_par_from_payload(row, _LIVE_SCORE_TO_PAR_KEYS),
-        current_thru=_normalize_thru_value(_value_from_payload(row, _LIVE_THRU_KEYS)),
-        today_score_to_par=_score_to_par_from_payload(row, _LIVE_TODAY_KEYS),
-        round_scores=_round_scores_from_live_row(row),
-        hole_scores=_hole_scores_from_live_row(row),
+    current_position = _normalize_position_value(_value_from_payload(row, _LIVE_POSITION_KEYS))
+    current_score_to_par = _score_to_par_from_live_row(row)
+    current_thru = _normalize_thru_value(_value_from_payload(row, _LIVE_THRU_KEYS))
+    today_score_to_par = _score_to_par_from_payload(row, _LIVE_TODAY_KEYS)
+    round_scores = _round_scores_from_live_row(row)
+    hole_scores = _hole_scores_from_live_row(row)
+
+    derived_total = _derive_total_to_par_from_round_data(
+        round_scores=round_scores,
+        today_score_to_par=today_score_to_par,
+        current_thru=current_thru,
     )
+    rounds_are_to_par = _round_scores_look_like_to_par(round_scores)
+    if derived_total is not None and (
+        current_score_to_par is None
+        or (
+            rounds_are_to_par
+            and abs(float(current_score_to_par) - float(derived_total)) >= 0.75
+        )
+        or (
+            abs(float(current_score_to_par)) <= 0.1
+            and abs(float(derived_total)) >= 0.5
+        )
+    ):
+        current_score_to_par = derived_total
+
+    return _LiveScoreSnapshot(
+        current_position=current_position,
+        current_score_to_par=current_score_to_par,
+        current_thru=current_thru,
+        today_score_to_par=today_score_to_par,
+        round_scores=round_scores,
+        hole_scores=hole_scores,
+    )
+
+
+def _reconcile_merged_live_scores(records: list[_PlayerRecord]) -> None:
+    inferred_round_par = _infer_round_par_from_records(records)
+    for record in records:
+        derived_total = _derive_total_to_par_from_round_data(
+            round_scores=record.round_scores,
+            today_score_to_par=record.today_score_to_par,
+            current_thru=record.current_thru,
+            inferred_round_par=inferred_round_par,
+        )
+        if derived_total is None:
+            continue
+
+        current_score = record.current_score_to_par
+        if current_score is None:
+            record.current_score_to_par = derived_total
+            continue
+
+        # Live feeds sometimes return stale "E" while the round is in progress.
+        if abs(float(current_score)) <= 0.1 and abs(float(derived_total)) >= 0.5:
+            record.current_score_to_par = derived_total
+            continue
+
+        thru_holes = _thru_to_hole_count(record.current_thru)
+        if (
+            thru_holes is not None
+            and 1 <= thru_holes < 18
+            and record.today_score_to_par is not None
+            and abs(float(record.today_score_to_par)) >= 0.5
+            and abs(float(current_score) - float(derived_total)) >= 0.75
+        ):
+            record.current_score_to_par = derived_total
+
+
+def _infer_round_par_from_records(records: list[_PlayerRecord]) -> float | None:
+    candidates: list[float] = []
+    for record in records:
+        current_score = record.current_score_to_par
+        if current_score is None or not record.round_scores:
+            continue
+        if _round_scores_look_like_to_par(record.round_scores):
+            continue
+
+        round_values = np.asarray(record.round_scores, dtype=np.float64)
+        if round_values.size == 0 or not np.isfinite(round_values).all():
+            continue
+
+        thru_holes = _thru_to_hole_count(record.current_thru)
+        adjusted_total = float(current_score)
+        if thru_holes is not None and 1 <= thru_holes < 18:
+            today = record.today_score_to_par
+            if today is None:
+                continue
+            # Ignore likely placeholder totals ("E") while in-progress.
+            if abs(float(current_score)) <= 0.1 and abs(float(today)) >= 0.5:
+                continue
+            adjusted_total -= float(today)
+
+        par_candidate = (float(np.sum(round_values)) - adjusted_total) / float(round_values.size)
+        if 66.0 <= par_candidate <= 75.0:
+            candidates.append(float(par_candidate))
+
+    if not candidates:
+        return None
+    return float(np.median(np.asarray(candidates, dtype=np.float64)))
 
 
 def _round_scores_from_live_row(row: dict[str, Any]) -> list[float]:
@@ -1142,6 +1811,110 @@ def _sanitize_hole_scores(values: list[float]) -> list[int]:
     if len(out) > 18:
         return out[:18]
     return out
+
+
+def _score_to_par_from_live_row(row: dict[str, Any]) -> float | None:
+    # Prioritize player-level total score fields; avoid recursive grabs of hole-level "to_par"/"tot".
+    direct_value = _top_level_value_from_keys(row, _LIVE_SCORE_TO_PAR_KEYS)
+    direct = _score_to_par_from_value(direct_value)
+    if direct is not None:
+        return direct
+
+    fallback_value = _top_level_value_from_keys(row, _LIVE_SCORE_TO_PAR_FALLBACK_KEYS)
+    fallback = _score_to_par_from_value(fallback_value)
+    if fallback is not None:
+        return fallback
+
+    lowered = {str(k).lower(): v for k, v in row.items()}
+    for container in _LIVE_SCORE_NESTED_CONTAINERS:
+        nested = lowered.get(container)
+        if nested is None:
+            continue
+        nested_value = _value_from_payload(nested, _LIVE_SCORE_TO_PAR_KEYS)
+        nested_score = _score_to_par_from_value(nested_value)
+        if nested_score is not None:
+            return nested_score
+
+    return None
+
+
+def _top_level_value_from_keys(row: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    lowered = {str(k).lower(): v for k, v in row.items()}
+    for key in keys:
+        if key not in lowered:
+            continue
+        value = lowered[key]
+        if _is_empty_payload_value(value):
+            continue
+        return value
+    return None
+
+
+def _round_scores_look_like_to_par(round_scores: list[float]) -> bool:
+    if not round_scores:
+        return False
+    numeric = np.asarray(round_scores, dtype=np.float64)
+    if not np.isfinite(numeric).all():
+        return False
+    # To-par round values are usually small magnitudes; gross scores are ~65-80.
+    return bool(np.max(np.abs(numeric)) <= 20.0)
+
+
+def _derive_total_to_par_from_round_data(
+    round_scores: list[float],
+    today_score_to_par: float | None,
+    current_thru: str | None,
+    inferred_round_par: float | None = None,
+) -> float | None:
+    is_to_par_rounds = _round_scores_look_like_to_par(round_scores)
+
+    round_values = np.asarray(round_scores, dtype=np.float64)
+    round_total = float(np.sum(round_values))
+    thru_holes = _thru_to_hole_count(current_thru)
+
+    if not is_to_par_rounds:
+        # Some DataGolf payloads expose gross round scores (e.g. 74/68/66/65) plus today's to-par.
+        # Infer round par either from cohort context or from a completed round.
+        round_par = inferred_round_par
+        if round_par is None and (
+            today_score_to_par is not None
+            and round_values.size > 0
+            and thru_holes is not None
+            and thru_holes >= 18
+        ):
+            round_par = float(round_values[-1] - float(today_score_to_par))
+
+        if round_par is None or not (66.0 <= float(round_par) <= 75.0):
+            return None
+
+        completed_round_total = round_total - (float(round_par) * float(round_values.size))
+        if thru_holes is None or thru_holes <= 0 or thru_holes >= 18:
+            if abs(completed_round_total) <= 80.0:
+                return float(completed_round_total)
+            return None
+
+        if today_score_to_par is None:
+            return None
+        in_progress_total = completed_round_total + float(today_score_to_par)
+        if abs(in_progress_total) <= 80.0:
+            return float(in_progress_total)
+        return None
+
+    if thru_holes is None:
+        return round_total
+    if thru_holes >= 18:
+        return round_total
+    if thru_holes <= 0:
+        return round_total
+
+    if today_score_to_par is None:
+        return round_total
+
+    # Many feeds report completed rounds separately; add current in-progress today score.
+    # If the latest round score already equals today's value, avoid double counting.
+    if round_scores and abs(float(round_scores[-1]) - float(today_score_to_par)) <= 0.25:
+        return round_total
+    return round_total + float(today_score_to_par)
 
 
 def _score_to_par_from_payload(payload: Any, keys: tuple[str, ...]) -> float | None:
@@ -1299,11 +2072,24 @@ def _historical_event_descriptors(
     season: int,
     limit: int = 72,
 ) -> list[tuple[str, int]]:
+    records = _historical_event_records(
+        event_list_payload=event_list_payload,
+        season=season,
+        limit=limit,
+    )
+    return [(str(record["event_id"]), int(record["year"])) for record in records]
+
+
+def _historical_event_records(
+    event_list_payload: Any,
+    season: int,
+    limit: int = 72,
+) -> list[dict[str, Any]]:
     rows = _extract_rows(event_list_payload, ("event", "list", "historical", "schedule"))
     if not rows:
         rows = _collect_dict_nodes(event_list_payload)
 
-    descriptors: list[tuple[str, int]] = []
+    records: list[dict[str, Any]] = []
     seen: set[tuple[str, int]] = set()
     for row in rows:
         event_id = _string_from_keys(row, _EVENT_ID_KEYS)
@@ -1316,10 +2102,25 @@ def _historical_event_descriptors(
         if key in seen:
             continue
         seen.add(key)
-        descriptors.append(key)
-        if len(descriptors) >= limit:
+        records.append(
+            {
+                "event_id": event_id,
+                "year": int(year),
+                "date": _string_from_keys(row, _DATE_KEYS),
+            }
+        )
+        if len(records) >= limit:
             break
-    return descriptors
+
+    records.sort(key=lambda record: _safe_date_sort_key(_to_str(record.get("date"))))
+    total = len(records)
+    for idx, record in enumerate(records):
+        if total <= 1:
+            phase = _season_phase_from_date(_to_str(record.get("date")))
+            record["phase"] = 0.5 if phase is None else phase
+        else:
+            record["phase"] = float(idx / (total - 1))
+    return records
 
 
 def _normalized_player_key(player_key: str | None) -> str | None:
@@ -1547,6 +2348,8 @@ def _numeric_sequence_from_value(value: Any) -> list[float]:
                 continue
             if isinstance(item, str):
                 number = _to_float(item)
+                if number is None:
+                    number = _score_to_par_from_value(item)
                 if number is not None:
                     out.append(number)
                 continue
@@ -1564,6 +2367,20 @@ def _numeric_sequence_from_value(value: Any) -> list[float]:
                 )
                 if score is not None:
                     out.append(score)
+                    continue
+                score_to_par = _score_to_par_from_value(
+                    _string_from_keys(
+                        item,
+                        (
+                            "to_par",
+                            "score_to_par",
+                            "round_to_par",
+                            "today",
+                        ),
+                    )
+                )
+                if score_to_par is not None:
+                    out.append(score_to_par)
     elif isinstance(value, dict):
         nested = _numeric_sequence_from_value(list(value.values()))
         out.extend(nested)
@@ -1731,3 +2548,186 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _to_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _extract_player_event_features(
+    payload: Any,
+    event_phase: float,
+) -> list[dict[str, Any]]:
+    rows = _extract_rows(payload, ("event_stats", "event", "player"))
+    if not rows:
+        rows = _collect_dict_nodes(payload)
+
+    deduped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        canonical_key, player_id, player_name = _historical_player_identity(row)
+        if not canonical_key:
+            continue
+        metric = _event_level_metric_from_row(row)
+        if metric is None:
+            metric = _round_metric_from_row(row)
+        if metric is None:
+            round_scores = _round_scores_from_row(row)
+            if round_scores:
+                metric = float(-np.mean(np.asarray(round_scores, dtype=np.float64)))
+        if metric is None:
+            continue
+
+        finish_rank = _finish_rank_from_history_row(row)
+        existing = deduped.get(canonical_key)
+        if existing is None:
+            deduped[canonical_key] = {
+                "canonical_key": canonical_key,
+                "player_id": player_id,
+                "player_name": player_name,
+                "metric": float(metric),
+                "finish_rank": finish_rank,
+                "won": bool(finish_rank == 1 if finish_rank is not None else False),
+                "top10": bool(finish_rank is not None and finish_rank <= 10),
+                "event_phase": float(event_phase),
+                "n": 1,
+            }
+            continue
+
+        # Some payload variants duplicate rows; collapse to one event-level datapoint.
+        existing["metric"] = (
+            (float(existing["metric"]) * int(existing["n"])) + float(metric)
+        ) / float(int(existing["n"]) + 1)
+        existing["n"] = int(existing["n"]) + 1
+        if finish_rank is not None:
+            prior_rank = _to_float(existing.get("finish_rank"))
+            if prior_rank is None or finish_rank < prior_rank:
+                existing["finish_rank"] = int(finish_rank)
+            existing["won"] = bool(existing.get("won")) or finish_rank == 1
+            existing["top10"] = bool(existing.get("top10")) or finish_rank <= 10
+
+    out: list[dict[str, Any]] = []
+    for feature in deduped.values():
+        feature.pop("n", None)
+        out.append(feature)
+    return out
+
+
+def _finish_rank_from_history_row(row: dict[str, Any]) -> int | None:
+    fin_text = _string_from_keys(row, ("fin_text", "finish", "position", "pos", "rank"))
+    if fin_text:
+        parsed = _finish_text_to_rank(fin_text)
+        if parsed is not None:
+            return parsed
+    rank = _numeric_from_keys(row, ("finish", "position", "pos", "rank"))
+    if rank is None:
+        return None
+    rank_int = int(round(rank))
+    if rank_int <= 0:
+        return None
+    return rank_int
+
+
+def _finish_score_from_rank(rank_value: float | None) -> float | None:
+    if rank_value is None:
+        return None
+    rank = int(round(rank_value))
+    if rank <= 0:
+        return None
+    # Positive score for strong finishes, decays smoothly by rank.
+    return float(1.0 / np.sqrt(rank))
+
+
+def _ewma(values: list[float], alpha: float = 0.55) -> float | None:
+    if not values:
+        return None
+    clipped_alpha = float(np.clip(alpha, 0.05, 0.95))
+    estimate = float(values[0])
+    for value in values[1:]:
+        estimate = (clipped_alpha * float(value)) + ((1.0 - clipped_alpha) * estimate)
+    return float(estimate)
+
+
+def _phase_weighted_metric_from_profile(
+    profile: dict[str, Any],
+    target_phase: float,
+    default_value: float | None = None,
+) -> float | None:
+    metrics_raw = profile.get("event_metrics")
+    phases_raw = profile.get("event_phases")
+    if not isinstance(metrics_raw, list) or not isinstance(phases_raw, list):
+        return default_value
+    if not metrics_raw or not phases_raw:
+        return default_value
+
+    metrics = np.asarray(metrics_raw, dtype=np.float64)
+    phases = np.asarray(phases_raw, dtype=np.float64)
+    if metrics.size == 0 or phases.size == 0 or metrics.size != phases.size:
+        return default_value
+
+    target = float(np.clip(target_phase, 0.0, 1.0))
+    distance = np.abs(phases - target)
+    # Blend local seasonality with a mild global floor so sparse histories stay stable.
+    weights = np.exp(-0.5 * ((distance / 0.18) ** 2)) + 0.10
+    weight_total = float(np.sum(weights))
+    if weight_total <= 1e-8:
+        return default_value
+    return float(np.sum(weights * metrics) / weight_total)
+
+
+def _hot_streak_score(win_phases: list[float]) -> float:
+    if not win_phases:
+        return 0.0
+    phases = np.sort(np.asarray(win_phases, dtype=np.float64))
+    if phases.size == 1:
+        return 0.25
+    phase_gaps = np.diff(phases)
+    mean_gap = float(np.mean(phase_gaps)) if phase_gaps.size > 0 else 1.0
+    cluster_score = 1.0 - float(np.clip(mean_gap / 0.35, 0.0, 1.0))
+    win_count_boost = float(np.clip((phases.size - 1) / 4.0, 0.0, 1.0))
+    return float((0.65 * cluster_score) + (0.35 * win_count_boost))
+
+
+def _season_phase_from_date(date_value: str | None) -> float | None:
+    if not date_value:
+        return None
+    text = str(date_value).strip()
+    if not text:
+        return None
+
+    parsed: datetime | None = None
+    parse_candidates = [text]
+    if "T" in text:
+        parse_candidates.append(text.split("T")[0])
+    if " " in text:
+        parse_candidates.append(text.split(" ")[0])
+    parse_candidates.append(text[:10])
+
+    formats = ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%Y-%m-%dT%H:%M:%S")
+    for candidate in parse_candidates:
+        if not candidate:
+            continue
+        for fmt in formats:
+            try:
+                parsed = datetime.strptime(candidate, fmt)
+                break
+            except ValueError:
+                continue
+        if parsed is not None:
+            break
+
+    if parsed is None:
+        safe = _safe_date_sort_key(text)
+        if safe.year >= 9999:
+            return None
+        parsed = safe
+
+    year = int(parsed.year)
+    is_leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    days_in_year = 366 if is_leap else 365
+    day_of_year = int(parsed.timetuple().tm_yday)
+    if days_in_year <= 1:
+        return 0.5
+    return float(np.clip((day_of_year - 1) / (days_in_year - 1), 0.0, 1.0))

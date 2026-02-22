@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     datagolf_base_url: str = "https://feeds.datagolf.com"
     http_timeout_seconds: float = 20.0
     default_simulations: int = 10_000
+    learning_database_path: str = ".pga_sim_learning.sqlite3"
 
     model_config = SettingsConfigDict(
         env_file=".env",

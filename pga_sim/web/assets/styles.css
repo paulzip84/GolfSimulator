@@ -317,6 +317,20 @@ td.num {
   font-family: "IBM Plex Mono", monospace;
 }
 
+td.delta-up {
+  color: #0a6b49;
+  font-weight: 600;
+}
+
+td.delta-down {
+  color: #9a2d24;
+  font-weight: 600;
+}
+
+td.delta-flat {
+  color: #59656f;
+}
+
 .player-toggle {
   border: 0;
   background: transparent;
@@ -400,6 +414,65 @@ td.num {
 .scorecard-empty {
   color: var(--muted);
   font-size: 0.86rem;
+}
+
+.trend-detail {
+  margin-top: 6px;
+  border-top: 1px solid #dde9e6;
+  padding-top: 8px;
+  display: grid;
+  gap: 8px;
+}
+
+.trend-title {
+  font-size: 0.83rem;
+  color: #295853;
+  font-weight: 600;
+}
+
+.trend-stats {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.trend-sparkline {
+  width: 100%;
+  max-width: 380px;
+  height: 90px;
+  border: 1px solid #d6e6e2;
+  border-radius: 10px;
+  background: #ffffff;
+}
+
+.trend-area {
+  fill: rgba(12, 122, 112, 0.12);
+  stroke: none;
+}
+
+.trend-line {
+  fill: none;
+  stroke: #0b7b71;
+  stroke-width: 2;
+}
+
+.trend-dot {
+  stroke: #fff;
+  stroke-width: 1;
+}
+
+.trend-dot-first {
+  fill: #c9792f;
+}
+
+.trend-dot-last {
+  fill: #0b7b71;
+}
+
+.trend-meta {
+  color: #4b655f;
+  font-size: 0.8rem;
+  font-family: "IBM Plex Mono", monospace;
 }
 
 @keyframes rise {

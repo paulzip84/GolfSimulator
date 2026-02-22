@@ -121,3 +121,23 @@ def test_adaptive_recommends_higher_cap_when_target_not_met() -> None:
     assert out.stop_reason == "max_simulations_reached"
     assert out.recommended_simulations is not None
     assert out.recommended_simulations > 4_000
+
+
+def test_top_k_is_literal_place_not_field_percent() -> None:
+    totals = np.arange(20, dtype=np.float64).reshape(1, 20)
+    rng = np.random.default_rng(5)
+
+    top3 = HybridMarkovSimulator._top_k_place_probability(totals, 3, rng)
+    top5 = HybridMarkovSimulator._top_k_place_probability(totals, 5, np.random.default_rng(5))
+    top10 = HybridMarkovSimulator._top_k_place_probability(
+        totals,
+        10,
+        np.random.default_rng(5),
+    )
+
+    assert top3.sum() == 3.0
+    assert top5.sum() == 5.0
+    assert top10.sum() == 10.0
+    assert np.all(top3[:3] == 1.0)
+    assert np.all(top5[:5] == 1.0)
+    assert np.all(top10[:10] == 1.0)

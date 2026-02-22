@@ -81,4 +81,84 @@ class SimulationResponse(BaseModel):
     current_season: Optional[int] = None
     form_adjustment_applied: bool = False
     form_adjustment_note: Optional[str] = None
+    calibration_applied: bool = False
+    calibration_version: int = 0
+    calibration_note: Optional[str] = None
     players: list[PlayerSimulationOutput]
+
+
+class CalibrationMarketStatus(BaseModel):
+    market: str
+    alpha: float = 0.0
+    beta: float = 1.0
+    samples: int = 0
+    positives: int = 0
+    brier_before: Optional[float] = None
+    brier_after: Optional[float] = None
+    logloss_before: Optional[float] = None
+    logloss_after: Optional[float] = None
+
+
+class LearningStatusResponse(BaseModel):
+    tour: str
+    predictions_logged: int = 0
+    resolved_predictions: int = 0
+    resolved_events: int = 0
+    pending_events: int = 0
+    calibration_version: int = 0
+    calibration_updated_at: Optional[datetime] = None
+    markets: list[CalibrationMarketStatus] = Field(default_factory=list)
+
+
+class LearningSyncRequest(BaseModel):
+    tour: str = Field(default="pga")
+    max_events: int = Field(default=40, ge=1, le=200)
+
+
+class LearningSyncResponse(LearningStatusResponse):
+    outcomes_fetched: int = 0
+    events_processed: int = 0
+    event_ids_processed: list[str] = Field(default_factory=list)
+    awaiting_outcomes_count: int = 0
+    awaiting_outcomes_event_ids: list[str] = Field(default_factory=list)
+    retrain_executed: bool = False
+    sync_note: Optional[str] = None
+
+
+class LearningEventSnapshot(BaseModel):
+    run_id: str
+    created_at: datetime
+    simulations: Optional[int] = None
+    in_play_applied: bool = False
+
+
+class LearningEventTrendPoint(BaseModel):
+    run_id: str
+    created_at: datetime
+    win_probability: float
+    top_3_probability: float
+    top_5_probability: float
+    top_10_probability: float
+
+
+class LearningPlayerEventTrend(BaseModel):
+    player_id: Optional[str] = None
+    player_name: str
+    latest_win_probability: float
+    delta_win_since_first: Optional[float] = None
+    delta_win_since_previous: Optional[float] = None
+    latest_top_3_probability: float
+    latest_top_5_probability: float
+    latest_top_10_probability: float
+    points: list[LearningEventTrendPoint] = Field(default_factory=list)
+
+
+class LearningEventTrendsResponse(BaseModel):
+    tour: str
+    event_id: str
+    event_year: int
+    event_name: Optional[str] = None
+    snapshot_count: int = 0
+    latest_run_id: Optional[str] = None
+    snapshots: list[LearningEventSnapshot] = Field(default_factory=list)
+    players: list[LearningPlayerEventTrend] = Field(default_factory=list)

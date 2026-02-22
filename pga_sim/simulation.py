@@ -275,9 +275,9 @@ class HybridMarkovSimulator:
         return _ChunkMetrics(
             simulations=chunk_size,
             win_probability=self._winner_probability(totals),
-            top_3_probability=self._top_k_probability(totals, 3, rng),
-            top_5_probability=self._top_k_probability(totals, 5, rng),
-            top_10_probability=self._top_k_probability(totals, 10, rng),
+            top_3_probability=self._top_k_place_probability(totals, 3, rng),
+            top_5_probability=self._top_k_place_probability(totals, 5, rng),
+            top_10_probability=self._top_k_place_probability(totals, 10, rng),
             mean_finish=self._mean_finish(totals, rng),
             mean_total_relative_to_field=totals.mean(axis=0),
             made_cut_probability=alive.mean(axis=0),
@@ -368,7 +368,13 @@ class HybridMarkovSimulator:
         return (winners / winner_count).mean(axis=0)
 
     @staticmethod
-    def _top_k_probability(totals: np.ndarray, k: int, rng: np.random.Generator) -> np.ndarray:
+    def _top_k_place_probability(
+        totals: np.ndarray,
+        k: int,
+        rng: np.random.Generator,
+    ) -> np.ndarray:
+        # Literal place logic: top_3 means finish rank <= 3, top_5 <= 5, top_10 <= 10.
+        # This is never converted to a "top X% of field" threshold.
         n_simulations, n_players = totals.shape
         k = min(k, n_players)
         jitter = rng.uniform(0.0, 1e-6, size=totals.shape)

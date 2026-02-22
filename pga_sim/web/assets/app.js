@@ -2,6 +2,11 @@ const state = {
   events: [],
   latestResult: null,
   expandedPlayerKey: null,
+  latestLearningStatus: null,
+  eventTrends: null,
+  trendPlayerByKey: {},
+  autoRefreshTimerId: null,
+  simulationInFlight: false,
 };
 
 const TABLE_TOOLTIPS = {
@@ -39,6 +44,16 @@ const TABLE_TOOLTIPS = {
     layman: "Chance this player wins the tournament.",
     source: "Hybrid Markov + Monte Carlo simulation built from DataGolf player inputs.",
     calculation: "Share of simulations where the player finishes with the best score (ties split proportionally).",
+  },
+  win_delta_prev: {
+    layman: "How this player's win chance changed versus the previous snapshot.",
+    source: "Calculated from locally stored simulation snapshots for this event.",
+    calculation: "Current Win % minus previous snapshot Win %.",
+  },
+  win_delta_start: {
+    layman: "How this player's win chance changed versus the first snapshot in this event.",
+    source: "Calculated from locally stored simulation snapshots for this event.",
+    calculation: "Current Win % minus first snapshot Win %.",
   },
   top_3_probability: {
     layman: "Chance this player finishes in the top 3.",
@@ -89,6 +104,10 @@ const CONTROL_TOOLTIPS = {
     "Select a specific active event. Auto uses the latest event currently available in DataGolf feeds.",
   simulationsInput:
     "Maximum simulations to run (hard cap). In Auto Target mode this is a safety cap.",
+  liveAutoRefreshSelect:
+    "When enabled, reruns the simulation automatically on a fixed interval to track live probability movement.",
+  liveRefreshSecondsInput:
+    "Seconds between automatic simulation refreshes when Live Auto-Refresh is enabled.",
   resolutionModeSelect:
     "Auto Target: stop when CI precision target is met; Fixed Cap: always run exactly Simulations.",
   minSimulationsInput:
@@ -127,12 +146,18 @@ const CONTROL_TOOLTIPS = {
     "Optional random seed for reproducible simulation outputs. Leave blank for random run-to-run variation.",
   rowsInput:
     "Number of ranked players to display in the results table.",
+  syncLearningButton:
+    "Fetch outcomes for previously predicted events from DataGolf historical endpoints, then retrain calibration.",
+  refreshLearningButton:
+    "Reload learning stats without retraining.",
 };
 
 const ui = {
   tourSelect: document.getElementById("tourSelect"),
   eventSelect: document.getElementById("eventSelect"),
   simulationsInput: document.getElementById("simulationsInput"),
+  liveAutoRefreshSelect: document.getElementById("liveAutoRefreshSelect"),
+  liveRefreshSecondsInput: document.getElementById("liveRefreshSecondsInput"),
   resolutionModeSelect: document.getElementById("resolutionModeSelect"),
   minSimulationsInput: document.getElementById("minSimulationsInput"),
   simulationBatchSizeInput: document.getElementById("simulationBatchSizeInput"),
@@ -160,9 +185,12 @@ const ui = {
   rowsInput: document.getElementById("rowsInput"),
   loadEventsButton: document.getElementById("loadEventsButton"),
   simulateButton: document.getElementById("simulateButton"),
+  syncLearningButton: document.getElementById("syncLearningButton"),
+  refreshLearningButton: document.getElementById("refreshLearningButton"),
   applyRecommendationButton: document.getElementById("applyRecommendationButton"),
   status: document.getElementById("status"),
   formStatus: document.getElementById("formStatus"),
+  learningStatus: document.getElementById("learningStatus"),
   error: document.getElementById("error"),
   resultsSection: document.getElementById("resultsSection"),
   eventLabel: document.getElementById("eventLabel"),
@@ -170,6 +198,7 @@ const ui = {
   generatedLabel: document.getElementById("generatedLabel"),
   winnerLabel: document.getElementById("winnerLabel"),
   seasonWindowLabel: document.getElementById("seasonWindowLabel"),
+  calibrationLabel: document.getElementById("calibrationLabel"),
   winChart: document.getElementById("winChart"),
   resultsBody: document.getElementById("resultsBody"),
 };
@@ -196,9 +225,27 @@ function setFormStatus(message = "", running = false) {
   ui.formStatus.classList.toggle("idle", !running);
 }
 
+function setLearningStatus(message = "", running = false) {
+  ui.learningStatus.textContent = message;
+  ui.learningStatus.classList.toggle("running", running);
+  ui.learningStatus.classList.toggle("idle", !running);
+}
+
 function setBusy(isBusy) {
   ui.simulateButton.disabled = isBusy;
   ui.loadEventsButton.disabled = isBusy;
+  if (ui.liveAutoRefreshSelect) {
+    ui.liveAutoRefreshSelect.disabled = isBusy;
+  }
+  if (ui.liveRefreshSecondsInput) {
+    ui.liveRefreshSecondsInput.disabled = isBusy;
+  }
+  if (ui.syncLearningButton) {
+    ui.syncLearningButton.disabled = isBusy;
+  }
+  if (ui.refreshLearningButton) {
+    ui.refreshLearningButton.disabled = isBusy;
+  }
   if (ui.applyRecommendationButton) {
     ui.applyRecommendationButton.disabled = isBusy;
   }
@@ -256,6 +303,135 @@ function formatThru(value) {
     return "-";
   }
   return String(value);
+}
+
+function formatSignedPct(value) {
+  if (value == null || Number.isNaN(Number(value))) {
+    return "-";
+  }
+  const numeric = Number(value);
+  const abs = Math.abs(numeric * 100).toFixed(2);
+  if (numeric > 0) {
+    return `+${abs}%`;
+  }
+  if (numeric < 0) {
+    return `-${abs}%`;
+  }
+  return "0.00%";
+}
+
+function formatScore(value, digits = 4) {
+  if (value == null || Number.isNaN(Number(value))) {
+    return "-";
+  }
+  return Number(value).toFixed(digits);
+}
+
+function normalizeNameKey(name) {
+  if (!name) {
+    return "";
+  }
+  let out = String(name).trim().toLowerCase().replace(/\./g, "");
+  if (out.includes(",")) {
+    const pieces = out.split(",").map((piece) => piece.trim()).filter(Boolean);
+    if (pieces.length >= 2) {
+      out = `${pieces.slice(1).join(" ")} ${pieces[0]}`.trim();
+    }
+  }
+  return out.replace(/\s+/g, " ");
+}
+
+function canonicalPlayerKey(playerId, playerName) {
+  const id = String(playerId || "").trim().toLowerCase().replace(/\s+/g, "");
+  if (id) {
+    return id;
+  }
+  return normalizeNameKey(playerName);
+}
+
+function trendForPlayer(player) {
+  const idKey = canonicalPlayerKey(player.player_id, "");
+  if (idKey && state.trendPlayerByKey[idKey]) {
+    return state.trendPlayerByKey[idKey];
+  }
+  const nameKey = canonicalPlayerKey("", player.player_name);
+  if (nameKey && state.trendPlayerByKey[nameKey]) {
+    return state.trendPlayerByKey[nameKey];
+  }
+  return null;
+}
+
+function createWinTrendSparkline(points) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 360 88");
+  svg.setAttribute("class", "trend-sparkline");
+  if (!Array.isArray(points) || points.length < 2) {
+    return svg;
+  }
+
+  const values = points.map((point) => Number(point.win_probability || 0));
+  const minV = Math.min(...values);
+  const maxV = Math.max(...values);
+  const span = Math.max(maxV - minV, 1e-6);
+  const left = 8;
+  const right = 352;
+  const top = 8;
+  const bottom = 80;
+  const usableW = right - left;
+  const usableH = bottom - top;
+  const xStep = usableW / Math.max(1, points.length - 1);
+
+  const toX = (idx) => left + (idx * xStep);
+  const toY = (value) => bottom - (((value - minV) / span) * usableH);
+  const pathData = points
+    .map((point, idx) => `${idx === 0 ? "M" : "L"}${toX(idx).toFixed(2)} ${toY(Number(point.win_probability || 0)).toFixed(2)}`)
+    .join(" ");
+
+  const areaPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  const areaData = `${pathData} L ${toX(points.length - 1).toFixed(2)} ${bottom} L ${toX(0).toFixed(2)} ${bottom} Z`;
+  areaPath.setAttribute("d", areaData);
+  areaPath.setAttribute("class", "trend-area");
+
+  const linePath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  linePath.setAttribute("d", pathData);
+  linePath.setAttribute("class", "trend-line");
+
+  const firstDot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  firstDot.setAttribute("cx", toX(0).toFixed(2));
+  firstDot.setAttribute("cy", toY(values[0]).toFixed(2));
+  firstDot.setAttribute("r", "3");
+  firstDot.setAttribute("class", "trend-dot trend-dot-first");
+
+  const lastDot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  lastDot.setAttribute("cx", toX(values.length - 1).toFixed(2));
+  lastDot.setAttribute("cy", toY(values[values.length - 1]).toFixed(2));
+  lastDot.setAttribute("r", "3.5");
+  lastDot.setAttribute("class", "trend-dot trend-dot-last");
+
+  svg.appendChild(areaPath);
+  svg.appendChild(linePath);
+  svg.appendChild(firstDot);
+  svg.appendChild(lastDot);
+  return svg;
+}
+
+function findMarketStatus(payload, marketName) {
+  if (!payload || !Array.isArray(payload.markets)) {
+    return null;
+  }
+  return payload.markets.find((market) => market.market === marketName) || null;
+}
+
+function renderLearningStatus(payload) {
+  state.latestLearningStatus = payload;
+  const winMarket = findMarketStatus(payload, "win");
+  const brierSummary =
+    winMarket && winMarket.samples > 0
+      ? `win Brier ${formatScore(winMarket.brier_before)} -> ${formatScore(winMarket.brier_after)}`
+      : "win Brier unavailable (need resolved outcomes)";
+  setLearningStatus(
+    `Learning v${payload.calibration_version} | resolved events=${payload.resolved_events} | pending=${payload.pending_events} | ${brierSummary}`
+  );
 }
 
 function playerRowKey(player, index) {
@@ -322,6 +498,20 @@ function appendResultCell(tr, columnKey, text, numeric = true, extraClassName = 
     td.title = tooltip;
   }
   tr.appendChild(td);
+}
+
+function deltaClassName(value) {
+  if (value == null || Number.isNaN(Number(value))) {
+    return "delta-flat";
+  }
+  const numeric = Number(value);
+  if (numeric > 1e-9) {
+    return "delta-up";
+  }
+  if (numeric < -1e-9) {
+    return "delta-down";
+  }
+  return "delta-flat";
 }
 
 function buildPlayerCell(player, rowKey, expanded) {
@@ -410,6 +600,42 @@ function buildScorecardDetails(player) {
     wrapper.appendChild(empty);
   }
 
+  const trend = trendForPlayer(player);
+  if (trend && Array.isArray(trend.points) && trend.points.length > 0) {
+    const trendBlock = document.createElement("div");
+    trendBlock.className = "trend-detail";
+
+    const title = document.createElement("div");
+    title.className = "trend-title";
+    title.textContent = `Win% Trend (${trend.points.length} snapshots)`;
+    trendBlock.appendChild(title);
+
+    const statRow = document.createElement("div");
+    statRow.className = "trend-stats";
+    const chips = [
+      `Latest: ${formatPct(trend.latest_win_probability)}`,
+      `Since First: ${formatPct(trend.delta_win_since_first)}`,
+      `Since Previous: ${formatPct(trend.delta_win_since_previous)}`,
+    ];
+    chips.forEach((chipText) => {
+      const chip = document.createElement("span");
+      chip.className = "scorecard-pill";
+      chip.textContent = chipText;
+      statRow.appendChild(chip);
+    });
+    trendBlock.appendChild(statRow);
+    trendBlock.appendChild(createWinTrendSparkline(trend.points));
+
+    const lastPoint = trend.points[trend.points.length - 1];
+    if (lastPoint && lastPoint.created_at) {
+      const meta = document.createElement("div");
+      meta.className = "trend-meta";
+      meta.textContent = `Latest snapshot: ${formatDate(lastPoint.created_at)}`;
+      trendBlock.appendChild(meta);
+    }
+    wrapper.appendChild(trendBlock);
+  }
+
   return wrapper;
 }
 
@@ -491,6 +717,168 @@ async function loadEvents() {
   }
 }
 
+async function loadLearningStatus(silent = false) {
+  if (!silent) {
+    setLearningStatus("Loading learning status...", true);
+  }
+  try {
+    const tour = encodeURIComponent(ui.tourSelect.value);
+    const response = await fetch(`/learning/status?tour=${tour}`);
+    if (!response.ok) {
+      let detail = `Unable to load learning status (${response.status})`;
+      try {
+        const errPayload = await response.json();
+        if (errPayload?.detail) {
+          detail = String(errPayload.detail);
+        }
+      } catch (_) {
+        // Keep default detail message when body is not JSON.
+      }
+      throw new Error(detail);
+    }
+    const payload = await response.json();
+    renderLearningStatus(payload);
+  } catch (error) {
+    if (!silent) {
+      setLearningStatus("Unable to load learning status.");
+      setError(error.message || "Unexpected error while loading learning status.");
+    }
+  }
+}
+
+async function syncLearningAndRetrain() {
+  setError();
+  setBusy(true);
+  setLearningStatus("Syncing outcomes and retraining calibration...", true);
+  try {
+    const response = await fetch("/learning/sync-train", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        tour: ui.tourSelect.value,
+        max_events: 40,
+      }),
+    });
+    if (!response.ok) {
+      let detail = `Learning sync failed (${response.status})`;
+      try {
+        const errPayload = await response.json();
+        if (errPayload?.detail) {
+          detail = String(errPayload.detail);
+        }
+      } catch (_) {
+        // Keep default detail message when body is not JSON.
+      }
+      throw new Error(detail);
+    }
+    const payload = await response.json();
+    renderLearningStatus(payload);
+    const statusParts = [
+      `events_processed=${payload.events_processed}`,
+      `outcomes_fetched=${payload.outcomes_fetched}`,
+      `awaiting_official=${payload.awaiting_outcomes_count || 0}`,
+      `retrain=${payload.retrain_executed ? "yes" : "no"}`,
+      `version=v${payload.calibration_version}`,
+    ];
+    if (payload.sync_note) {
+      statusParts.push(payload.sync_note);
+    }
+    setStatus(`Learning sync complete. ${statusParts.join(" | ")}`);
+  } catch (error) {
+    setStatus("Learning sync/retrain failed.");
+    setError(error.message || "Unexpected error during learning retrain.");
+  } finally {
+    setBusy(false);
+  }
+}
+
+function resetEventTrends() {
+  state.eventTrends = null;
+  state.trendPlayerByKey = {};
+}
+
+function indexEventTrends(payload) {
+  const byKey = {};
+  const players = Array.isArray(payload?.players) ? payload.players : [];
+  players.forEach((player) => {
+    const idKey = canonicalPlayerKey(player.player_id, "");
+    const nameKey = canonicalPlayerKey("", player.player_name);
+    if (idKey) {
+      byKey[idKey] = player;
+    }
+    if (nameKey) {
+      byKey[nameKey] = player;
+    }
+  });
+  state.eventTrends = payload;
+  state.trendPlayerByKey = byKey;
+}
+
+async function loadEventTrendsForCurrentEvent({ silent = true } = {}) {
+  if (!state.latestResult || !state.latestResult.event_id) {
+    resetEventTrends();
+    return;
+  }
+  try {
+    const query = new URLSearchParams({
+      tour: state.latestResult.tour || ui.tourSelect.value,
+      event_id: state.latestResult.event_id,
+      max_snapshots: "80",
+      max_players: "80",
+    });
+    const response = await fetch(`/learning/event-trends?${query.toString()}`);
+    if (!response.ok) {
+      let detail = `Unable to fetch event trends (${response.status})`;
+      try {
+        const errPayload = await response.json();
+        if (errPayload?.detail) {
+          detail = String(errPayload.detail);
+        }
+      } catch (_) {
+        // Keep default message when response body is not JSON.
+      }
+      throw new Error(detail);
+    }
+    const payload = await response.json();
+    indexEventTrends(payload);
+    if (state.latestResult) {
+      renderTable(state.latestResult.players);
+    }
+  } catch (error) {
+    if (!silent) {
+      setError(error.message || "Unexpected error while loading event trends.");
+    }
+    resetEventTrends();
+  }
+}
+
+function stopAutoRefresh() {
+  if (state.autoRefreshTimerId != null) {
+    window.clearInterval(state.autoRefreshTimerId);
+    state.autoRefreshTimerId = null;
+  }
+}
+
+function applyAutoRefreshSchedule() {
+  stopAutoRefresh();
+  if (!ui.liveAutoRefreshSelect || ui.liveAutoRefreshSelect.value !== "yes") {
+    return;
+  }
+  const seconds = Math.max(
+    15,
+    Math.min(900, Number.parseInt(ui.liveRefreshSecondsInput.value, 10) || 60)
+  );
+  state.autoRefreshTimerId = window.setInterval(() => {
+    if (state.simulationInFlight) {
+      return;
+    }
+    void runSimulation(true);
+  }, seconds * 1000);
+  setStatus(`Live auto-refresh enabled every ${seconds}s.`);
+}
+
 function renderWinChart(players) {
   ui.winChart.innerHTML = "";
   const topTen = players.slice(0, 10);
@@ -556,6 +944,21 @@ function renderTable(players) {
     );
     appendResultCell(tr, "current_thru", formatThru(player.current_thru), false);
     appendResultCell(tr, "win_probability", formatPct(player.win_probability), true);
+    const trend = trendForPlayer(player);
+    appendResultCell(
+      tr,
+      "win_delta_prev",
+      formatSignedPct(trend ? trend.delta_win_since_previous : null),
+      true,
+      deltaClassName(trend ? trend.delta_win_since_previous : null)
+    );
+    appendResultCell(
+      tr,
+      "win_delta_start",
+      formatSignedPct(trend ? trend.delta_win_since_first : null),
+      true,
+      deltaClassName(trend ? trend.delta_win_since_first : null)
+    );
     appendResultCell(tr, "top_3_probability", formatPct(player.top_3_probability), true);
     appendResultCell(tr, "top_5_probability", formatPct(player.top_5_probability), true);
     appendResultCell(tr, "top_10_probability", formatPct(player.top_10_probability), true);
@@ -616,6 +1019,16 @@ function renderResult(payload) {
   } else {
     ui.seasonWindowLabel.textContent = "-";
   }
+  if (payload.calibration_applied) {
+    ui.calibrationLabel.textContent = `Applied v${payload.calibration_version}`;
+  } else if (payload.calibration_version > 0) {
+    ui.calibrationLabel.textContent = `Available v${payload.calibration_version}`;
+  } else {
+    ui.calibrationLabel.textContent = "Not trained";
+  }
+  if (payload.calibration_note) {
+    ui.calibrationLabel.title = payload.calibration_note;
+  }
   setFormStatus(
     payload.form_adjustment_note
       ? payload.form_adjustment_note
@@ -640,11 +1053,18 @@ function renderResult(payload) {
   ui.resultsSection.hidden = false;
 }
 
-async function runSimulation() {
+async function runSimulation(fromAutoRefresh = false) {
+  if (state.simulationInFlight || ui.simulateButton.disabled) {
+    return;
+  }
+  state.simulationInFlight = true;
   setError();
   setFormStatus("Loading seasonal form data...", true);
   setBusy(true);
-  setStatus("Running simulation...", true);
+  setStatus(
+    fromAutoRefresh ? "Running auto-refresh simulation..." : "Running simulation...",
+    true
+  );
 
   try {
     const simulations = Number.parseInt(ui.simulationsInput.value, 10) || 10000;
@@ -722,6 +1142,7 @@ async function runSimulation() {
 
     const payload = await response.json();
     renderResult(payload);
+    await loadEventTrendsForCurrentEvent({ silent: true });
     const statusBits = [];
     if (payload.stop_reason) {
       statusBits.push(`stop=${payload.stop_reason}`);
@@ -732,19 +1153,47 @@ async function runSimulation() {
     if (payload.in_play_conditioning_note) {
       statusBits.push(payload.in_play_conditioning_note);
     }
+    if (payload.calibration_note) {
+      statusBits.push(payload.calibration_note);
+    }
     setStatus(statusBits.length > 0 ? `Simulation complete. ${statusBits.join(" | ")}` : "Simulation complete.");
+    void loadLearningStatus(true);
   } catch (error) {
     setStatus("Simulation failed.");
     setError(error.message || "Unexpected error while running the simulation.");
   } finally {
     setBusy(false);
+    state.simulationInFlight = false;
   }
 }
 
 function bindEvents() {
   ui.loadEventsButton.addEventListener("click", loadEvents);
-  ui.simulateButton.addEventListener("click", runSimulation);
-  ui.tourSelect.addEventListener("change", loadEvents);
+  ui.simulateButton.addEventListener("click", () => {
+    void runSimulation(false);
+  });
+  if (ui.syncLearningButton) {
+    ui.syncLearningButton.addEventListener("click", syncLearningAndRetrain);
+  }
+  if (ui.refreshLearningButton) {
+    ui.refreshLearningButton.addEventListener("click", () => loadLearningStatus());
+  }
+  ui.tourSelect.addEventListener("change", () => {
+    resetEventTrends();
+    void loadEvents();
+    void loadLearningStatus(true);
+  });
+  if (ui.eventSelect) {
+    ui.eventSelect.addEventListener("change", () => {
+      resetEventTrends();
+    });
+  }
+  if (ui.liveAutoRefreshSelect) {
+    ui.liveAutoRefreshSelect.addEventListener("change", applyAutoRefreshSchedule);
+  }
+  if (ui.liveRefreshSecondsInput) {
+    ui.liveRefreshSecondsInput.addEventListener("change", applyAutoRefreshSchedule);
+  }
   ui.meanReversionInput.addEventListener("input", () => {
     ui.meanReversionValue.textContent = Number.parseFloat(ui.meanReversionInput.value).toFixed(2);
   });
@@ -802,6 +1251,8 @@ function init() {
   ui.currentSeasonWeightValue.textContent = Number.parseFloat(ui.currentSeasonWeightInput.value).toFixed(2);
   ui.formDeltaWeightValue.textContent = Number.parseFloat(ui.formDeltaWeightInput.value).toFixed(2);
   loadEvents();
+  loadLearningStatus(true);
+  applyAutoRefreshSchedule();
 }
 
 init();

@@ -16,6 +16,7 @@ Outputs are player-by-player probabilities for:
 - `pga_sim/datagolf_client.py`: DataGolf API client.
 - `pga_sim/service.py`: Data extraction, normalization, feature synthesis.
 - `pga_sim/simulation.py`: Hybrid Markov + Monte Carlo engine (vectorized NumPy).
+- `pga_sim/learning.py`: Local SQLite learning store, outcome ingestion, and calibration retraining.
 - `pga_sim/api.py`: FastAPI server and local GUI routes.
 - `pga_sim/web/index.html`: Browser GUI entry page.
 - `pga_sim/web/assets/app.js`: GUI event loading + simulation actions.
@@ -65,6 +66,7 @@ The GUI lets you:
 - See which events are currently simulatable (others appear as unavailable in the dropdown).
 - Set simulations, cut size, mean reversion, and optional seed.
 - Configure a seasonal-form blend using last season as baseline and current season as form delta.
+- Sync completed event outcomes and retrain local probability calibration over time.
 - Run the model with one click.
 - View top players and probabilities (win/top 3/top 5/top 10) in table + chart form.
 - Inspect seasonal diagnostics in the UI status line (events/players loaded per season and matched active-field players).
@@ -119,6 +121,9 @@ Endpoints:
 - `GET /ui` (GUI alias)
 - `GET /events/upcoming?tour=pga&limit=12`
 - `POST /simulate`
+- `GET /learning/status?tour=pga`
+- `POST /learning/sync-train`
+- `GET /learning/event-trends?tour=pga&event_id=14`
 
 Example request:
 
@@ -150,10 +155,24 @@ curl -X POST "http://127.0.0.1:8000/simulate" \
   - Loads historical rounds for `baseline_season` (default last year) and `current_season` (default current year).
   - Computes per-player season metrics and blends them into simulation skill:
     - `seasonal_form_weight` controls impact of seasonal blend versus current DataGolf priors.
-    - `current_season_weight` controls baseline-vs-current emphasis.
-    - `form_delta_weight` controls the lift/penalty from current minus baseline season form.
+    - `current_season_weight` is now a base prior that is adapted per player using starts, recent finishes, and baseline-season seasonality/hot-streak signals.
+    - `form_delta_weight` controls extra lift/penalty from shrunk current-vs-baseline seasonal delta.
+  - Start-count aware shrinkage:
+    - Players with few or zero current-season starts are shrunk toward their baseline seasonal anchor.
+    - This avoids incorrectly treating no-start players as "out of form".
+  - Baseline seasonality:
+    - Baseline event history is phase-weighted (early/mid/late season) to build a phase-specific anchor for each player.
+    - Baseline win clustering feeds a hot-streak signal used in player-specific seasonal blending.
 - Monte Carlo draws trajectories through the Markov chain for all players, all rounds.
 - PGA cut logic is applied after round 2 (top `cut_size`, including ties).
+- `top_3`, `top_5`, and `top_10` are literal finish-place probabilities (`finish_rank <= 3/5/10`), not field-percentile buckets.
+- Self-learning loop:
+  - Every simulation run is logged locally to SQLite (`.pga_sim_learning.sqlite3` by default).
+  - For completed events, outcomes are pulled from DataGolf `historical-event-data/events`.
+  - The app retrains per-market probability calibration (`win`, `top_3`, `top_5`, `top_10`) and applies it to future runs.
+- Live probability movement:
+  - Enable `Live Auto-Refresh` in the GUI to rerun in-play conditioned simulations on a cadence.
+  - Expanded player rows show win-probability trend snapshots and deltas over the tournament.
 
 ## Testing
 
