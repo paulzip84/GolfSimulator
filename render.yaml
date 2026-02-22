@@ -1,0 +1,48 @@
+services:
+  - type: web
+    name: golfsimulator
+    runtime: python
+    plan: starter
+    autoDeploy: true
+    buildCommand: pip install --upgrade pip && pip install .
+    startCommand: uvicorn pga_sim.api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    disk:
+      name: learning-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: DATAGOLF_API_KEY
+        sync: false
+      - key: DATAGOLF_BASE_URL
+        value: https://feeds.datagolf.com
+      - key: HTTP_TIMEOUT_SECONDS
+        value: "20"
+      - key: DEFAULT_SIMULATIONS
+        value: "10000"
+      - key: LEARNING_DATABASE_PATH
+        value: /var/data/pga_sim_learning.sqlite3
+      - key: APP_AUTH_MODE
+        value: cloudflare_access
+      - key: APP_AUTH_EXEMPT_PATHS
+        value: /health
+      - key: APP_AUTH_SHARED_TOKEN
+        sync: false
+      - key: APP_AUTH_SHARED_TOKEN_ROLE
+        value: admin
+      - key: AUTH_ALLOWED_EMAILS
+        sync: false
+      - key: AUTH_ALLOWED_EMAIL_DOMAINS
+        sync: false
+      - key: AUTH_ADMIN_EMAILS
+        sync: false
+      - key: AUTH_ADMIN_EMAIL_DOMAINS
+        sync: false
+      - key: AUTH_ADMIN_SUBJECTS
+        sync: false
+      - key: CLOUDFLARE_ACCESS_TEAM_DOMAIN
+        sync: false
+      - key: CLOUDFLARE_ACCESS_AUDIENCE
+        sync: false
