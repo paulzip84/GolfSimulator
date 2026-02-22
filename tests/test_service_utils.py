@@ -169,3 +169,34 @@ def test_merge_player_records_derives_in_progress_totals_from_cohort_par() -> No
     # Sum of completed gross rounds = 210. Inferred event par = 72 from finished player.
     # Completed-round to-par = 210 - (72*3) = -6; add today's -3 => -9.
     assert by_name["In Progress Player"].current_score_to_par == -9.0
+
+
+def test_merge_player_records_does_not_regress_thru_from_complete_to_in_progress() -> None:
+    service = SimulationService(object())  # type: ignore[arg-type]
+    field_rows = [
+        {
+            "player_id": "1",
+            "player_name": "Complete Player",
+            "position": "1",
+            "score_to_par": "-11",
+            "thru": "F",
+            "today": "-4",
+            "round_scores": [70, 68, 67, 68],
+        }
+    ]
+    live_rows = [
+        {
+            "player_id": "1",
+            "player_name": "Complete Player",
+            "position": "1",
+            "score_to_par": "-9",
+            "thru": "15",
+            "today": "-2",
+        }
+    ]
+
+    records = service._merge_player_records(field_rows, [], [], live_rows)
+    assert len(records) == 1
+    record = records[0]
+    assert record.current_thru == "F"
+    assert record.current_score_to_par == -11.0

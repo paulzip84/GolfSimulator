@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Optional
 
+from pga_sim.datagolf_client import DataGolfAPIError
 from pga_sim.learning import LearningStore
 from pga_sim.models import SimulationRequest
 from pga_sim.service import SimulationService
@@ -97,6 +98,52 @@ class _LearningClient:
         }
 
 
+class _HistoricalUnavailableLearningClient(_LearningClient):
+    async def get_field_updates(self, tour: str = "pga", event_id: Optional[str] = None):
+        field_rows = []
+        for idx, player in enumerate(_players(), start=1):
+            field_rows.append(
+                {
+                    "player_id": player["player_id"],
+                    "player_name": player["player_name"],
+                    "position": str(idx),
+                    "score_to_par": float(-14 + idx),
+                    "thru": "F",
+                    "today": 0,
+                    "round_scores": [70, 69, 68, 67 + idx],
+                }
+            )
+        return {
+            "event_id": "99",
+            "event_name": "Fallback Open",
+            "date": "2026-02-22",
+            "field": field_rows,
+        }
+
+    async def get_in_play(
+        self,
+        tour: str = "pga",
+        dead_heat: str = "no",
+        odds_format: str = "percent",
+    ):
+        # Stale live row should not override a completed field-updates row.
+        return {
+            "preds": [
+                {
+                    "player_id": _players()[0]["player_id"],
+                    "player_name": _players()[0]["player_name"],
+                    "position": "1",
+                    "score_to_par": "-12",
+                    "thru": "15",
+                    "today": "-3",
+                }
+            ]
+        }
+
+    async def get_historical_event(self, tour: str, event_id: str, year: int):
+        raise DataGolfAPIError("historical endpoint not published yet")
+
+
 def test_service_logs_predictions_and_retrains_learning(tmp_path) -> None:
     learning_store = LearningStore(str(tmp_path / "service_learning.sqlite3"))
     service = SimulationService(_LearningClient(), learning_store=learning_store)
@@ -123,6 +170,7 @@ def test_service_logs_predictions_and_retrains_learning(tmp_path) -> None:
     sync = asyncio.run(service.sync_learning_and_retrain(tour="pga", max_events=10))
     assert sync.events_processed == 1
     assert sync.outcomes_fetched == 1
+    assert sync.provisional_outcomes_fetched == 0
     assert sync.calibration_version == 1
     assert sync.retrain_executed is True
     assert sync.awaiting_outcomes_count == 0
@@ -150,3 +198,30 @@ def test_service_logs_predictions_and_retrains_learning(tmp_path) -> None:
     assert trends.snapshot_count >= 1
     assert trends.event_id == "14"
     assert len(trends.players) > 0
+
+
+def test_service_sync_uses_provisional_outcomes_when_official_feed_lags(tmp_path) -> None:
+    learning_store = LearningStore(str(tmp_path / "service_learning_fallback.sqlite3"))
+    service = SimulationService(_HistoricalUnavailableLearningClient(), learning_store=learning_store)
+
+    result = asyncio.run(
+        service.simulate(
+            SimulationRequest(
+                tour="pga",
+                simulations=4000,
+                seed=12,
+                enable_in_play_conditioning=False,
+                enable_seasonal_form=False,
+            )
+        )
+    )
+    assert result.event_id == "99"
+
+    sync = asyncio.run(service.sync_learning_and_retrain(tour="pga", max_events=10))
+    assert sync.events_processed == 1
+    assert sync.outcomes_fetched == 1
+    assert sync.provisional_outcomes_fetched == 1
+    assert sync.awaiting_outcomes_count == 0
+    assert sync.retrain_executed is True
+    assert sync.calibration_version == 1
+    assert sync.provisional_event_ids == ["99:2026"]

@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from .datagolf_client import DataGolfAPIError, DataGolfClient
-from .learning import CalibrationMetrics, LearningStore
+from .learning import CalibrationMetrics, LearningStore, PendingOutcomeEvent
 from .models import (
     CalibrationMarketStatus,
     EventSummary,
@@ -594,6 +594,8 @@ class SimulationService:
         processed_event_ids: list[str] = []
         awaiting_outcomes_event_ids: list[str] = []
         outcomes_fetched = 0
+        provisional_outcomes_fetched = 0
+        provisional_event_ids: list[str] = []
 
         def event_label(event: Any) -> str:
             name = str(event.event_name).strip() if getattr(event, "event_name", None) else ""
@@ -601,26 +603,45 @@ class SimulationService:
             return f"{name} ({base})" if name else base
 
         for event in pending_events:
+            official_payload: Any | None = None
             try:
-                payload = await self._datagolf.get_historical_event(
+                official_payload = await self._datagolf.get_historical_event(
                     tour=event.tour,
                     event_id=event.event_id,
                     year=event.event_year,
                 )
             except DataGolfAPIError:
-                awaiting_outcomes_event_ids.append(event_label(event))
-                continue
-            outcome_rows = self._learning.record_outcome_payload(
-                tour=event.tour,
-                event_id=event.event_id,
-                event_year=event.event_year,
-                payload=payload,
-            )
-            if outcome_rows > 0:
-                outcomes_fetched += 1
-                processed_event_ids.append(f"{event.event_id}:{event.event_year}")
-            else:
-                awaiting_outcomes_event_ids.append(event_label(event))
+                official_payload = None
+
+            if official_payload is not None:
+                official_rows = self._learning.record_outcome_payload(
+                    tour=event.tour,
+                    event_id=event.event_id,
+                    event_year=event.event_year,
+                    payload=official_payload,
+                )
+                if official_rows > 0:
+                    outcomes_fetched += 1
+                    processed_event_ids.append(f"{event.event_id}:{event.event_year}")
+                    continue
+
+            provisional_payload = await self._build_provisional_outcome_payload(event=event)
+            if provisional_payload is not None:
+                provisional_rows = self._learning.record_outcome_payload(
+                    tour=event.tour,
+                    event_id=event.event_id,
+                    event_year=event.event_year,
+                    payload=provisional_payload,
+                )
+                if provisional_rows > 0:
+                    outcomes_fetched += 1
+                    provisional_outcomes_fetched += 1
+                    event_token = f"{event.event_id}:{event.event_year}"
+                    provisional_event_ids.append(event_token)
+                    processed_event_ids.append(event_token)
+                    continue
+
+            awaiting_outcomes_event_ids.append(event_label(event))
 
         retrain_executed = False
         should_retrain = outcomes_fetched > 0 or (
@@ -640,6 +661,11 @@ class SimulationService:
             note_parts.append(f"Fetched outcomes for {outcomes_fetched} events.")
         else:
             note_parts.append("No new outcomes fetched.")
+
+        if provisional_outcomes_fetched > 0:
+            note_parts.append(
+                f"Used provisional leaderboard outcomes for {provisional_outcomes_fetched} event(s) while awaiting official publication."
+            )
 
         if awaiting_outcomes_event_ids:
             preview = ", ".join(awaiting_outcomes_event_ids[:4])
@@ -674,13 +700,70 @@ class SimulationService:
             calibration_updated_at=status["calibration_updated_at"],
             markets=self._market_status_models(status["markets"]),
             outcomes_fetched=outcomes_fetched,
+            provisional_outcomes_fetched=provisional_outcomes_fetched,
             events_processed=len(pending_events),
             event_ids_processed=processed_event_ids,
+            provisional_event_ids=provisional_event_ids,
             awaiting_outcomes_count=len(awaiting_outcomes_event_ids),
             awaiting_outcomes_event_ids=awaiting_outcomes_event_ids,
             retrain_executed=retrain_executed,
             sync_note=note,
         )
+
+    async def _build_provisional_outcome_payload(
+        self,
+        *,
+        event: PendingOutcomeEvent,
+    ) -> dict[str, Any] | None:
+        try:
+            field_payload = await self._datagolf.get_field_updates(
+                tour=event.tour,
+                event_id=event.event_id,
+            )
+        except DataGolfAPIError:
+            return None
+
+        pending_event_id = _normalized_event_id(event.event_id)
+        active_event_id = _normalized_event_id(_string_from_payload(field_payload, _EVENT_ID_KEYS))
+        if pending_event_id and active_event_id and pending_event_id != active_event_id:
+            return None
+
+        live_payload: Any = {}
+        get_in_play = getattr(self._datagolf, "get_in_play", None)
+        if callable(get_in_play):
+            try:
+                live_payload = await get_in_play(
+                    tour=event.tour,
+                    odds_format="percent",
+                )
+            except DataGolfAPIError:
+                live_payload = {}
+
+        field_rows = _extract_rows(field_payload, ("field", "player"))
+        live_rows = _extract_rows(live_payload, ("in-play", "player", "pred"))
+        players = self._merge_player_records(field_rows, [], [], live_rows)
+        provisional_rows, leaderboard_complete = _provisional_outcome_rows(players)
+        if not leaderboard_complete or not provisional_rows:
+            return None
+
+        event_name = (
+            str(event.event_name).strip()
+            if getattr(event, "event_name", None)
+            else _string_from_payload(field_payload, _EVENT_NAME_KEYS)
+        )
+        completed = (
+            _string_from_payload(field_payload, ("event_completed", "date", "completed"))
+            or event.event_date
+            or datetime.now(timezone.utc).date().isoformat()
+        )
+        return {
+            "tour": event.tour,
+            "event_id": event.event_id,
+            "event_name": event_name,
+            "year": event.event_year,
+            "event_completed": completed,
+            "event_stats": provisional_rows,
+        }
 
     @staticmethod
     def _market_status_models(
@@ -772,18 +855,7 @@ class SimulationService:
                 if not record.player_name and player_name:
                     record.player_name = player_name
 
-            if live_snapshot.current_position is not None:
-                record.current_position = live_snapshot.current_position
-            if live_snapshot.current_score_to_par is not None:
-                record.current_score_to_par = live_snapshot.current_score_to_par
-            if live_snapshot.current_thru is not None:
-                record.current_thru = live_snapshot.current_thru
-            if live_snapshot.today_score_to_par is not None:
-                record.today_score_to_par = live_snapshot.today_score_to_par
-            if live_snapshot.round_scores:
-                record.round_scores = live_snapshot.round_scores
-            if live_snapshot.hole_scores:
-                record.hole_scores = live_snapshot.hole_scores
+            _merge_live_snapshot_into_record(record, live_snapshot)
             name_index[_normalized_name(player_name)] = resolved_key
 
         for row in live_rows or []:
@@ -800,18 +872,7 @@ class SimulationService:
             if not record.player_name and player_name:
                 record.player_name = player_name
             live_snapshot = _extract_live_score_snapshot(row)
-            if live_snapshot.current_position is not None:
-                record.current_position = live_snapshot.current_position
-            if live_snapshot.current_score_to_par is not None:
-                record.current_score_to_par = live_snapshot.current_score_to_par
-            if live_snapshot.current_thru is not None:
-                record.current_thru = live_snapshot.current_thru
-            if live_snapshot.today_score_to_par is not None:
-                record.today_score_to_par = live_snapshot.today_score_to_par
-            if live_snapshot.round_scores:
-                record.round_scores = live_snapshot.round_scores
-            if live_snapshot.hole_scores:
-                record.hole_scores = live_snapshot.hole_scores
+            _merge_live_snapshot_into_record(record, live_snapshot)
             name_index[_normalized_name(player_name)] = resolved_key
 
         for row in pre_rows:
@@ -1689,6 +1750,84 @@ def _extract_live_score_snapshot(row: dict[str, Any]) -> _LiveScoreSnapshot:
     )
 
 
+def _merge_live_snapshot_into_record(record: _PlayerRecord, snapshot: _LiveScoreSnapshot) -> None:
+    if _prefer_incoming_live_snapshot(record, snapshot):
+        _apply_live_snapshot(record, snapshot, fill_only=False)
+        return
+    _apply_live_snapshot(record, snapshot, fill_only=True)
+
+
+def _apply_live_snapshot(
+    record: _PlayerRecord,
+    snapshot: _LiveScoreSnapshot,
+    *,
+    fill_only: bool,
+) -> None:
+    if snapshot.current_position is not None and (not fill_only or record.current_position is None):
+        record.current_position = snapshot.current_position
+    if snapshot.current_score_to_par is not None and (
+        not fill_only or record.current_score_to_par is None
+    ):
+        record.current_score_to_par = snapshot.current_score_to_par
+    if snapshot.current_thru is not None and (not fill_only or record.current_thru is None):
+        record.current_thru = snapshot.current_thru
+    if snapshot.today_score_to_par is not None and (
+        not fill_only or record.today_score_to_par is None
+    ):
+        record.today_score_to_par = snapshot.today_score_to_par
+    if snapshot.round_scores and (not fill_only or not record.round_scores):
+        record.round_scores = snapshot.round_scores
+    if snapshot.hole_scores and (not fill_only or not record.hole_scores):
+        record.hole_scores = snapshot.hole_scores
+
+
+def _prefer_incoming_live_snapshot(
+    record: _PlayerRecord,
+    snapshot: _LiveScoreSnapshot,
+) -> bool:
+    existing_thru = _thru_to_hole_count(record.current_thru)
+    incoming_thru = _thru_to_hole_count(snapshot.current_thru)
+
+    if existing_thru is not None and incoming_thru is not None:
+        if existing_thru >= 18 and incoming_thru < 18:
+            return False
+        if incoming_thru >= 18 and existing_thru < 18:
+            return True
+        if incoming_thru > existing_thru:
+            return True
+        if incoming_thru < existing_thru:
+            return False
+        # Same completion depth: prefer the later feed update.
+        if snapshot.current_position is not None:
+            return True
+    elif existing_thru is None and incoming_thru is not None:
+        return True
+    elif existing_thru is not None and incoming_thru is None:
+        return False
+
+    existing_round_count = len(record.round_scores)
+    incoming_round_count = len(snapshot.round_scores)
+    if incoming_round_count != existing_round_count:
+        return incoming_round_count > existing_round_count
+
+    existing_hole_count = len(record.hole_scores)
+    incoming_hole_count = len(snapshot.hole_scores)
+    if incoming_hole_count != existing_hole_count:
+        return incoming_hole_count > existing_hole_count
+
+    if record.current_score_to_par is None and snapshot.current_score_to_par is not None:
+        return True
+    if record.current_score_to_par is not None and snapshot.current_score_to_par is None:
+        return False
+
+    if record.today_score_to_par is None and snapshot.today_score_to_par is not None:
+        return True
+    if record.today_score_to_par is not None and snapshot.today_score_to_par is None:
+        return False
+
+    return True
+
+
 def _reconcile_merged_live_scores(records: list[_PlayerRecord]) -> None:
     inferred_round_par = _infer_round_par_from_records(records)
     for record in records:
@@ -1986,6 +2125,81 @@ def _normalize_position_value(value: Any) -> str | None:
             return str(int(number))
         return str(number)
     return text
+
+
+def _position_rank_from_value(value: Any) -> int | None:
+    normalized = _normalize_position_value(value)
+    if not normalized:
+        return None
+    upper = normalized.strip().upper()
+    if upper.startswith("T"):
+        upper = upper[1:]
+    if upper.isdigit():
+        rank = int(upper)
+        return rank if rank > 0 else None
+    numeric = _to_float(upper)
+    if numeric is None or numeric < 0:
+        return None
+    rounded = int(round(numeric))
+    return rounded if rounded > 0 else None
+
+
+def _provisional_outcome_rows(
+    players: list[_PlayerRecord],
+) -> tuple[list[dict[str, Any]], bool]:
+    if not players:
+        return [], False
+
+    rows: list[dict[str, Any]] = []
+    in_progress_count = 0
+    finished_count = 0
+    thru_known_count = 0
+
+    for player in players:
+        rank = _position_rank_from_value(player.current_position)
+        if rank is not None:
+            rows.append(
+                {
+                    "player_id": player.player_id,
+                    "player_name": player.player_name,
+                    "position": player.current_position,
+                    "fin_text": player.current_position or str(rank),
+                }
+            )
+
+        thru_holes = _thru_to_hole_count(player.current_thru)
+        if thru_holes is None:
+            continue
+        thru_known_count += 1
+        if 1 <= thru_holes < 18:
+            in_progress_count += 1
+        elif thru_holes >= 18:
+            finished_count += 1
+
+    rows.sort(
+        key=lambda row: (
+            _position_rank_from_value(row.get("position")) or 10_000,
+            str(row.get("player_name") or ""),
+        )
+    )
+
+    ranked_count = len(rows)
+    player_count = len(players)
+    minimum_ranked = max(8, int(np.ceil(player_count * 0.20)))
+    if ranked_count < minimum_ranked:
+        return rows, False
+
+    if thru_known_count <= 0:
+        return rows, False
+
+    if in_progress_count == 0:
+        return rows, True
+
+    stale_allowance = max(1, int(np.ceil(player_count * 0.03)))
+    if in_progress_count <= stale_allowance and finished_count >= max(8, thru_known_count - stale_allowance):
+        return rows, True
+
+    return rows, False
 
 
 def _normalize_thru_value(value: Any) -> str | None:

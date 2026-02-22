@@ -778,6 +778,7 @@ async function syncLearningAndRetrain() {
     const statusParts = [
       `events_processed=${payload.events_processed}`,
       `outcomes_fetched=${payload.outcomes_fetched}`,
+      `provisional_outcomes=${payload.provisional_outcomes_fetched || 0}`,
       `awaiting_official=${payload.awaiting_outcomes_count || 0}`,
       `retrain=${payload.retrain_executed ? "yes" : "no"}`,
       `version=v${payload.calibration_version}`,

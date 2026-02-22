@@ -117,8 +117,10 @@ class LearningSyncRequest(BaseModel):
 
 class LearningSyncResponse(LearningStatusResponse):
     outcomes_fetched: int = 0
+    provisional_outcomes_fetched: int = 0
     events_processed: int = 0
     event_ids_processed: list[str] = Field(default_factory=list)
+    provisional_event_ids: list[str] = Field(default_factory=list)
     awaiting_outcomes_count: int = 0
     awaiting_outcomes_event_ids: list[str] = Field(default_factory=list)
     retrain_executed: bool = False

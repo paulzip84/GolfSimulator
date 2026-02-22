@@ -179,6 +179,7 @@ curl -X POST "http://127.0.0.1:8000/simulate" \
 - Self-learning loop:
   - Every simulation run is logged locally to SQLite (`.pga_sim_learning.sqlite3` by default).
   - For completed events, outcomes are pulled from DataGolf `historical-event-data/events`.
+  - If official historical outcomes are temporarily delayed, the sync step can fallback to a completed live leaderboard snapshot as a provisional outcome source, then retrain and replace with official outcomes once published.
   - The app retrains per-market probability calibration (`win`, `top_3`, `top_5`, `top_10`) and applies it to future runs.
 - Live probability movement:
   - Enable `Live Auto-Refresh` in the GUI to rerun in-play conditioned simulations on a cadence.
