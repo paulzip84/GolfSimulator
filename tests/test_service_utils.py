@@ -200,3 +200,24 @@ def test_merge_player_records_does_not_regress_thru_from_complete_to_in_progress
     record = records[0]
     assert record.current_thru == "F"
     assert record.current_score_to_par == -11.0
+
+
+def test_merge_player_records_infers_final_thru_from_full_round_scorecard() -> None:
+    service = SimulationService(object())  # type: ignore[arg-type]
+    field_rows = [
+        {
+            "player_id": "1",
+            "player_name": "Stale Thru Player",
+            "position": "1",
+            "score_to_par": "-11",
+            "thru": "15",
+            "today": "-4",
+            "round_scores": [70, 68, 67, 68],
+        }
+    ]
+
+    records = service._merge_player_records(field_rows, [], [], [])
+    assert len(records) == 1
+    record = records[0]
+    assert record.current_thru == "F"
+    assert record.current_score_to_par == -11.0

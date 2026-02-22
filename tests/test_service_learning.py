@@ -108,7 +108,8 @@ class _HistoricalUnavailableLearningClient(_LearningClient):
                     "player_name": player["player_name"],
                     "position": str(idx),
                     "score_to_par": float(-14 + idx),
-                    "thru": "F",
+                    # Simulate stale thru values despite complete round scorecards.
+                    "thru": "15",
                     "today": 0,
                     "round_scores": [70, 69, 68, 67 + idx],
                 }
@@ -216,6 +217,7 @@ def test_service_sync_uses_provisional_outcomes_when_official_feed_lags(tmp_path
         )
     )
     assert result.event_id == "99"
+    assert result.players[0].current_thru == "F"
 
     sync = asyncio.run(service.sync_learning_and_retrain(tour="pga", max_events=10))
     assert sync.events_processed == 1

@@ -1831,6 +1831,7 @@ def _prefer_incoming_live_snapshot(
 def _reconcile_merged_live_scores(records: list[_PlayerRecord]) -> None:
     inferred_round_par = _infer_round_par_from_records(records)
     for record in records:
+        _normalize_record_completion(record)
         derived_total = _derive_total_to_par_from_round_data(
             round_scores=record.round_scores,
             today_score_to_par=record.today_score_to_par,
@@ -1859,6 +1860,15 @@ def _reconcile_merged_live_scores(records: list[_PlayerRecord]) -> None:
             and abs(float(current_score) - float(derived_total)) >= 0.75
         ):
             record.current_score_to_par = derived_total
+
+
+def _normalize_record_completion(record: _PlayerRecord, total_rounds: int = 4) -> None:
+    if len(record.round_scores) < total_rounds:
+        return
+    thru_holes = _thru_to_hole_count(record.current_thru)
+    if thru_holes is not None and thru_holes >= 18:
+        return
+    record.current_thru = "F"
 
 
 def _infer_round_par_from_records(records: list[_PlayerRecord]) -> float | None:
@@ -2152,8 +2162,8 @@ def _provisional_outcome_rows(
 
     rows: list[dict[str, Any]] = []
     in_progress_count = 0
-    finished_count = 0
-    thru_known_count = 0
+    complete_count = 0
+    known_progress_count = 0
 
     for player in players:
         rank = _position_rank_from_value(player.current_position)
@@ -2167,14 +2177,13 @@ def _provisional_outcome_rows(
                 }
             )
 
-        thru_holes = _thru_to_hole_count(player.current_thru)
-        if thru_holes is None:
-            continue
-        thru_known_count += 1
-        if 1 <= thru_holes < 18:
+        known_progress, is_complete, is_in_progress = _record_progress_state(player)
+        if known_progress:
+            known_progress_count += 1
+        if is_complete:
+            complete_count += 1
+        if is_in_progress:
             in_progress_count += 1
-        elif thru_holes >= 18:
-            finished_count += 1
 
     rows.sort(
         key=lambda row: (
@@ -2189,17 +2198,47 @@ def _provisional_outcome_rows(
     if ranked_count < minimum_ranked:
         return rows, False
 
-    if thru_known_count <= 0:
+    minimum_known_progress = max(8, int(np.ceil(player_count * 0.25)))
+    if known_progress_count < minimum_known_progress:
         return rows, False
 
-    if in_progress_count == 0:
-        return rows, True
-
-    stale_allowance = max(1, int(np.ceil(player_count * 0.03)))
-    if in_progress_count <= stale_allowance and finished_count >= max(8, thru_known_count - stale_allowance):
+    # Retrain fallback should only run once the leaderboard appears complete.
+    if in_progress_count == 0 and complete_count >= max(8, known_progress_count):
         return rows, True
 
     return rows, False
+
+
+def _record_progress_state(record: _PlayerRecord, total_rounds: int = 4) -> tuple[bool, bool, bool]:
+    known = False
+    complete = False
+    in_progress = False
+
+    thru_normalized = _normalize_thru_value(record.current_thru)
+    thru_holes = _thru_to_hole_count(thru_normalized)
+    if thru_normalized is not None:
+        known = True
+        if thru_normalized in {"MC", "WD", "DQ"}:
+            complete = True
+        elif thru_holes is not None:
+            if thru_holes >= 18:
+                complete = True
+            elif 1 <= thru_holes < 18:
+                in_progress = True
+
+    position_normalized = _normalize_position_value(record.current_position)
+    if position_normalized in {"MC", "WD", "DQ"}:
+        known = True
+        complete = True
+        in_progress = False
+
+    round_count = len(record.round_scores)
+    if round_count >= total_rounds:
+        known = True
+        complete = True
+        in_progress = False
+
+    return known, complete, in_progress
 
 
 def _normalize_thru_value(value: Any) -> str | None:
