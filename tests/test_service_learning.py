@@ -202,6 +202,46 @@ class _ScheduledWithStaleLiveLearningClient(_LearningClient):
         }
 
 
+class _InPlayLiveScoresLearningClient(_LearningClient):
+    async def get_field_updates(self, tour: str = "pga", event_id: Optional[str] = None):
+        return {
+            "event_id": "14",
+            "event_name": "Masters Tournament",
+            "date": "2025-04-12",
+            "field": [
+                {
+                    "player_id": player["player_id"],
+                    "player_name": player["player_name"],
+                    "position": f"T{idx + 1}",
+                    "score_to_par": float(-10 + idx),
+                    "thru": "12",
+                    "today": float(-2 + (idx % 3)),
+                    "round_scores": [70, 68, 69],
+                }
+                for idx, player in enumerate(_players())
+            ],
+        }
+
+    async def get_in_play(
+        self,
+        tour: str = "pga",
+        dead_heat: str = "no",
+        odds_format: str = "percent",
+    ):
+        return {
+            "preds": [
+                {
+                    "player_id": _players()[0]["player_id"],
+                    "player_name": _players()[0]["player_name"],
+                    "position": "1",
+                    "score_to_par": "-12",
+                    "thru": "13",
+                    "today": "-3",
+                }
+            ]
+        }
+
+
 def test_service_logs_predictions_and_retrains_learning(tmp_path) -> None:
     learning_store = LearningStore(str(tmp_path / "service_learning.sqlite3"))
     service = SimulationService(
@@ -427,6 +467,35 @@ def test_service_ignores_stale_live_feed_when_event_is_scheduled(tmp_path) -> No
     assert result.in_play_conditioning_applied is False
     assert result.in_play_conditioning_note is not None
     assert "has not started" in result.in_play_conditioning_note.lower()
+
+
+def test_service_live_scores_returns_lightweight_live_rows(tmp_path) -> None:
+    learning_store = LearningStore(str(tmp_path / "service_live_scores.sqlite3"))
+    service = SimulationService(
+        _InPlayLiveScoresLearningClient(),
+        learning_store=learning_store,
+        lifecycle_target_year=2025,
+    )
+
+    scores = asyncio.run(service.get_live_scores(tour="pga", event_id="14"))
+    assert scores.event_id == "14"
+    assert scores.event_state == "in_play"
+    assert len(scores.players) >= 8
+    assert scores.players[0].current_position is not None
+
+
+def test_service_live_scores_ignores_stale_in_play_when_field_scheduled(tmp_path) -> None:
+    learning_store = LearningStore(str(tmp_path / "service_live_scores_stale.sqlite3"))
+    service = SimulationService(
+        _ScheduledWithStaleLiveLearningClient(),
+        learning_store=learning_store,
+        lifecycle_target_year=2025,
+    )
+
+    scores = asyncio.run(service.get_live_scores(tour="pga"))
+    assert scores.event_state == "scheduled"
+    assert scores.source_note is not None
+    assert "ignored stale in-play feed" in scores.source_note.lower()
 
 
 def test_service_skips_harmful_calibration_snapshot(tmp_path) -> None:

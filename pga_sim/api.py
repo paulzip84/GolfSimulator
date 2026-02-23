@@ -18,6 +18,7 @@ from .datagolf_client import DataGolfAPIError, DataGolfClient
 from .learning import LearningStore
 from .models import (
     EventSummary,
+    LiveScoresResponse,
     LifecycleStatusResponse,
     LearningEventTrendsResponse,
     LearningStatusResponse,
@@ -235,6 +236,19 @@ async def learning_latest_snapshot(
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DataGolfAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/live/scores", response_model=LiveScoresResponse)
+async def live_scores(
+    tour: str = Query(default="pga"),
+    event_id: Optional[str] = Query(default=None),
+) -> LiveScoresResponse:
+    try:
+        return await _service.get_live_scores(tour=tour, event_id=event_id)
     except DataGolfAPIError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except ValueError as exc:

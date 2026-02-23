@@ -9,9 +9,11 @@ const state = {
   autoRefreshTimerId: null,
   autoSimulationTimerId: null,
   lifecyclePollTimerId: null,
+  liveScorePollTimerId: null,
   simulationInFlight: false,
 };
 const AUTOMATION_SIMULATION_INTERVAL_SECONDS = 120;
+const LIVE_SCORE_POLL_INTERVAL_SECONDS = 30;
 
 function isFiniteNumber(value) {
   const numeric = Number(value);
@@ -633,6 +635,9 @@ function renderLifecycleStatus(payload) {
   if (state.autoSimulationTimerId != null && !state.simulationInFlight && !shouldAutoRunSimulationNow()) {
     setSimulationAutomationStatus(autoSimulationPausedMessage(), false);
   }
+  if (!state.simulationInFlight && shouldAutoRunSimulationNow() && state.latestResult) {
+    void refreshLiveScoresOnly({ silent: true });
+  }
   renderLifecycleHistory(payload.recent_events || []);
   updateVersionCallouts();
 }
@@ -1130,7 +1135,7 @@ async function loadEventTrendsForCurrentEvent({ silent = true } = {}) {
       tour: state.latestResult.tour || ui.tourSelect.value,
       event_id: state.latestResult.event_id,
       max_snapshots: "80",
-      max_players: "80",
+      max_players: "200",
     });
     const response = await fetch(`/learning/event-trends?${query.toString()}`);
     if (!response.ok) {
@@ -1155,6 +1160,101 @@ async function loadEventTrendsForCurrentEvent({ silent = true } = {}) {
       setError(error.message || "Unexpected error while loading event trends.");
     }
     resetEventTrends();
+  }
+}
+
+function mergeLiveScoresIntoLatestResult(payload) {
+  if (!state.latestResult || !Array.isArray(state.latestResult.players)) {
+    return 0;
+  }
+  const livePlayers = Array.isArray(payload?.players) ? payload.players : [];
+  if (livePlayers.length === 0) {
+    return 0;
+  }
+
+  const liveByKey = {};
+  livePlayers.forEach((row) => {
+    const idKey = canonicalPlayerKey(row.player_id, "");
+    const nameKey = canonicalPlayerKey("", row.player_name);
+    if (idKey) {
+      liveByKey[idKey] = row;
+    }
+    if (nameKey) {
+      liveByKey[nameKey] = row;
+    }
+  });
+
+  let updated = 0;
+  state.latestResult.players = state.latestResult.players.map((player) => {
+    const idKey = canonicalPlayerKey(player.player_id, "");
+    const nameKey = canonicalPlayerKey("", player.player_name);
+    const liveRow = (idKey && liveByKey[idKey]) || (nameKey && liveByKey[nameKey]);
+    if (!liveRow) {
+      return player;
+    }
+    updated += 1;
+    return {
+      ...player,
+      current_position:
+        liveRow.current_position != null ? liveRow.current_position : player.current_position,
+      current_score_to_par:
+        liveRow.current_score_to_par != null
+          ? liveRow.current_score_to_par
+          : player.current_score_to_par,
+      current_thru: liveRow.current_thru != null ? liveRow.current_thru : player.current_thru,
+      today_score_to_par:
+        liveRow.today_score_to_par != null ? liveRow.today_score_to_par : player.today_score_to_par,
+      round_scores:
+        Array.isArray(liveRow.round_scores) && liveRow.round_scores.length > 0
+          ? liveRow.round_scores
+          : player.round_scores,
+      hole_scores:
+        Array.isArray(liveRow.hole_scores) && liveRow.hole_scores.length > 0
+          ? liveRow.hole_scores
+          : player.hole_scores,
+    };
+  });
+
+  if (updated > 0) {
+    renderTable(state.latestResult.players);
+  }
+  return updated;
+}
+
+async function refreshLiveScoresOnly({ silent = true } = {}) {
+  if (!state.latestResult) {
+    return;
+  }
+  const tourValue = state.latestResult.tour || ui.tourSelect.value;
+  const selectedEventId = (state.latestResult.event_id || ui.eventSelect?.value || "").trim();
+  const query = new URLSearchParams({ tour: tourValue });
+  if (selectedEventId) {
+    query.set("event_id", selectedEventId);
+  }
+  try {
+    const response = await fetch(`/live/scores?${query.toString()}`);
+    if (!response.ok) {
+      let detail = `Unable to refresh live scores (${response.status})`;
+      try {
+        const errPayload = await response.json();
+        if (errPayload?.detail) {
+          detail = String(errPayload.detail);
+        }
+      } catch (_) {
+        // Keep default detail message when body is not JSON.
+      }
+      throw new Error(detail);
+    }
+
+    const payload = await response.json();
+    const changedRows = mergeLiveScoresIntoLatestResult(payload);
+    if (!silent && changedRows > 0) {
+      setStatus(`Live scores refreshed (${changedRows} players).`);
+    }
+  } catch (error) {
+    if (!silent) {
+      setError(error.message || "Unexpected error while refreshing live scores.");
+    }
   }
 }
 
@@ -1243,11 +1343,31 @@ function stopLifecyclePoll() {
   }
 }
 
+function stopLiveScorePoll() {
+  if (state.liveScorePollTimerId != null) {
+    window.clearInterval(state.liveScorePollTimerId);
+    state.liveScorePollTimerId = null;
+  }
+}
+
 function startLifecyclePoll() {
   stopLifecyclePoll();
   state.lifecyclePollTimerId = window.setInterval(() => {
     void loadLifecycleStatus(true);
   }, 45000);
+}
+
+function startLiveScorePoll() {
+  stopLiveScorePoll();
+  state.liveScorePollTimerId = window.setInterval(() => {
+    if (state.simulationInFlight) {
+      return;
+    }
+    if (!shouldAutoRunSimulationNow()) {
+      return;
+    }
+    void refreshLiveScoresOnly({ silent: true });
+  }, LIVE_SCORE_POLL_INTERVAL_SECONDS * 1000);
 }
 
 function startAutoSimulation() {
@@ -1723,6 +1843,7 @@ function init() {
   loadLifecycleStatus(true);
   applyAutoRefreshSchedule();
   startLifecyclePoll();
+  startLiveScorePoll();
 }
 
 init();

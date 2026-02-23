@@ -89,6 +89,27 @@ class SimulationResponse(BaseModel):
     players: list[PlayerSimulationOutput]
 
 
+class LiveScoreRow(BaseModel):
+    player_id: Optional[str] = None
+    player_name: str
+    current_position: Optional[str] = None
+    current_score_to_par: Optional[float] = None
+    current_thru: Optional[str] = None
+    today_score_to_par: Optional[float] = None
+    round_scores: list[float] = Field(default_factory=list)
+    hole_scores: list[int] = Field(default_factory=list)
+
+
+class LiveScoresResponse(BaseModel):
+    generated_at: datetime
+    tour: str
+    event_id: Optional[str] = None
+    event_name: Optional[str] = None
+    event_state: str = "scheduled"
+    source_note: Optional[str] = None
+    players: list[LiveScoreRow] = Field(default_factory=list)
+
+
 class CalibrationMarketStatus(BaseModel):
     market: str
     alpha: float = 0.0

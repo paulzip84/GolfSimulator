@@ -14,6 +14,8 @@ from .learning import CalibrationMetrics, LearningStore, PendingOutcomeEvent
 from .models import (
     CalibrationMarketStatus,
     EventSummary,
+    LiveScoreRow,
+    LiveScoresResponse,
     LifecycleEventStatus,
     LifecycleStatusResponse,
     LearningEventTrendsResponse,
@@ -976,6 +978,88 @@ class SimulationService:
             calibration_version=calibration_version,
             calibration_note=calibration_note,
             players=result_rows,
+        )
+
+    async def get_live_scores(
+        self,
+        *,
+        tour: str = "pga",
+        event_id: str | None = None,
+    ) -> LiveScoresResponse:
+        normalized_tour = (tour or "pga").strip().lower()
+        selected_event_id = _normalized_event_id(event_id)
+
+        field_payload = await self._datagolf.get_field_updates(
+            tour=normalized_tour,
+            event_id=event_id,
+        )
+        field_rows = _extract_rows(field_payload, ("field", "player"))
+        field_only_players = self._merge_player_records(field_rows, [], [], [])
+        field_state = _lifecycle_state_from_players(field_only_players)
+
+        live_payload: Any = {}
+        get_in_play = getattr(self._datagolf, "get_in_play", None)
+        if callable(get_in_play):
+            try:
+                live_payload = await get_in_play(
+                    tour=normalized_tour,
+                    odds_format="percent",
+                )
+            except DataGolfAPIError:
+                live_payload = {}
+        live_rows = _extract_rows(live_payload, ("in-play", "player", "pred"))
+        effective_live_rows = live_rows
+        notes: list[str] = []
+        if field_state == "scheduled" and live_rows:
+            effective_live_rows = []
+            notes.append("ignored stale in-play feed because field feed indicates event has not started")
+
+        active_event_id = _normalized_event_id(_string_from_payload(field_payload, _EVENT_ID_KEYS))
+        if selected_event_id and active_event_id and selected_event_id != active_event_id:
+            active_event_name = _string_from_payload(field_payload, _EVENT_NAME_KEYS) or "Unknown"
+            raise ValueError(
+                "Selected event is not available for this tour in DataGolf current-week score feeds. "
+                f"Active event: {active_event_name} (event_id={active_event_id})."
+            )
+
+        records = self._merge_player_records(field_rows, [], [], effective_live_rows)
+        records.sort(
+            key=lambda record: (
+                _position_rank_from_value(record.current_position) or 10_000,
+                _normalized_name(record.player_name),
+            )
+        )
+        event_state = _lifecycle_state_from_players(records)
+        resolved_event_id = (
+            event_id
+            or _string_from_payload(field_payload, _EVENT_ID_KEYS)
+            or _string_from_payload(live_payload, _EVENT_ID_KEYS)
+        )
+        resolved_event_name = (
+            _string_from_payload(field_payload, _EVENT_NAME_KEYS)
+            or _string_from_payload(live_payload, _EVENT_NAME_KEYS)
+        )
+
+        return LiveScoresResponse(
+            generated_at=datetime.now(timezone.utc),
+            tour=normalized_tour,
+            event_id=resolved_event_id,
+            event_name=resolved_event_name,
+            event_state=event_state,
+            source_note=("Data feed fallback: " + "; ".join(notes) + ".") if notes else None,
+            players=[
+                LiveScoreRow(
+                    player_id=record.player_id or None,
+                    player_name=record.player_name,
+                    current_position=record.current_position,
+                    current_score_to_par=record.current_score_to_par,
+                    current_thru=record.current_thru,
+                    today_score_to_par=record.today_score_to_par,
+                    round_scores=record.round_scores,
+                    hole_scores=record.hole_scores,
+                )
+                for record in records
+            ],
         )
 
     async def get_lifecycle_status(self, tour: str = "pga") -> LifecycleStatusResponse:
