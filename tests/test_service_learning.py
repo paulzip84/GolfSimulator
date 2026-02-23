@@ -157,6 +157,11 @@ class _PreTournamentUnavailableLearningClient(_LearningClient):
         raise DataGolfAPIError("pre-tournament feed temporarily unavailable")
 
 
+class _FieldUnavailableLearningClient(_LearningClient):
+    async def get_field_updates(self, tour: str = "pga", event_id: Optional[str] = None):
+        raise DataGolfAPIError("field-updates feed temporarily unavailable")
+
+
 class _ScheduledWithStaleLiveLearningClient(_LearningClient):
     async def get_field_updates(self, tour: str = "pga", event_id: Optional[str] = None):
         return {
@@ -314,6 +319,30 @@ def test_service_simulation_falls_back_when_pre_tournament_feed_errors(tmp_path)
     assert len(result.players) >= 8
     assert result.in_play_conditioning_note is not None
     assert "Data feed fallback:" in result.in_play_conditioning_note
+
+
+def test_service_simulation_falls_back_when_field_feed_errors(tmp_path) -> None:
+    learning_store = LearningStore(str(tmp_path / "service_learning_field_fallback.sqlite3"))
+    service = SimulationService(
+        _FieldUnavailableLearningClient(),
+        learning_store=learning_store,
+        lifecycle_target_year=2025,
+    )
+
+    result = asyncio.run(
+        service.simulate(
+            SimulationRequest(
+                tour="pga",
+                simulations=4000,
+                seed=15,
+                enable_in_play_conditioning=False,
+                enable_seasonal_form=False,
+            )
+        )
+    )
+    assert len(result.players) >= 8
+    assert result.in_play_conditioning_note is not None
+    assert "field updates unavailable" in result.in_play_conditioning_note.lower()
 
 
 def test_service_ignores_stale_live_feed_when_event_is_scheduled(tmp_path) -> None:

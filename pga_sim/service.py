@@ -321,14 +321,21 @@ class SimulationService:
         return events[:limit]
 
     async def simulate(self, request: SimulationRequest) -> SimulationResponse:
-        field_payload = await self._datagolf.get_field_updates(
-            tour=request.tour,
-            event_id=request.event_id,
-        )
+        field_payload: Any = {}
+        data_feed_warnings: list[str] = []
+        try:
+            field_payload = await self._datagolf.get_field_updates(
+                tour=request.tour,
+                event_id=request.event_id,
+            )
+        except DataGolfAPIError:
+            # Keep simulation available when field-updates has temporary outages.
+            data_feed_warnings.append(
+                "field updates unavailable; using pre-tournament/decomposition-only fallback"
+            )
 
         pre_payload: Any = {}
         decomp_payload: Any = {}
-        data_feed_warnings: list[str] = []
 
         aux_results = await asyncio.gather(
             self._datagolf.get_pre_tournament(
@@ -377,6 +384,10 @@ class SimulationService:
 
         selected_event_id = _normalized_event_id(request.event_id)
         active_event_id = _normalized_event_id(_string_from_payload(field_payload, _EVENT_ID_KEYS))
+        if selected_event_id and not active_event_id:
+            data_feed_warnings.append(
+                "unable to validate selected event against active field feed"
+            )
         if selected_event_id and active_event_id and selected_event_id != active_event_id:
             active_event_name = _string_from_payload(field_payload, _EVENT_NAME_KEYS) or "Unknown"
             raise ValueError(
