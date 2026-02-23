@@ -785,14 +785,10 @@ class LearningStore:
             delta_start = None
             if first_row_for_player is not None:
                 delta_start = current_win - float(first_row_for_player["win_probability"])
-            elif first_run_id == normalized_run_id:
-                delta_start = 0.0
 
             delta_prev = None
             if previous_row_for_player is not None:
                 delta_prev = current_win - float(previous_row_for_player["win_probability"])
-            elif previous_run_id is None:
-                delta_prev = 0.0
 
             output.append(
                 {

@@ -323,7 +323,7 @@ def test_service_simulation_response_includes_win_delta_fields(tmp_path) -> None
         )
     )
     assert len(first.players) >= 8
-    assert all(player.win_delta_prev == 0.0 for player in first.players)
+    assert all(player.win_delta_prev is None for player in first.players)
     assert all(player.win_delta_start == 0.0 for player in first.players)
 
     second = asyncio.run(

@@ -119,16 +119,6 @@ const TABLE_TOOLTIPS = {
     source: "Hybrid Markov + Monte Carlo simulation built from DataGolf player inputs.",
     calculation: "Share of simulations where the player finishes with the best score (ties split proportionally).",
   },
-  win_delta_prev: {
-    layman: "How this player's win chance changed versus the previous snapshot.",
-    source: "Calculated from locally stored simulation snapshots for this event.",
-    calculation: "Current Win % minus previous snapshot Win %.",
-  },
-  win_delta_start: {
-    layman: "How this player's win chance changed versus the first snapshot in this event.",
-    source: "Calculated from locally stored simulation snapshots for this event.",
-    calculation: "Current Win % minus first snapshot Win %.",
-  },
   top_3_probability: {
     layman: "Chance this player finishes in the top 3.",
     source: "Hybrid Markov + Monte Carlo simulation.",
@@ -420,12 +410,12 @@ function formatThru(value) {
   return String(value);
 }
 
-function formatSignedPct(value) {
+function formatSignedPct(value, decimals = 2) {
   if (value == null || Number.isNaN(Number(value))) {
     return "-";
   }
   const numeric = Number(value);
-  const abs = Math.abs(numeric * 100).toFixed(2);
+  const abs = Math.abs(numeric * 100).toFixed(decimals);
   if (numeric > 0) {
     return `+${abs}%`;
   }
@@ -1503,23 +1493,6 @@ function renderTable(players) {
     );
     appendResultCell(tr, "current_thru", formatThru(player.current_thru), false);
     appendResultCell(tr, "win_probability", formatPct(player.win_probability), true);
-    const trend = trendForPlayer(player);
-    const deltaPrev = winDeltaPrevForPlayer(player, trend);
-    const deltaStart = winDeltaStartForPlayer(player, trend);
-    appendResultCell(
-      tr,
-      "win_delta_prev",
-      formatSignedPct(deltaPrev),
-      true,
-      deltaClassName(deltaPrev)
-    );
-    appendResultCell(
-      tr,
-      "win_delta_start",
-      formatSignedPct(deltaStart),
-      true,
-      deltaClassName(deltaStart)
-    );
     appendResultCell(tr, "top_3_probability", formatPct(player.top_3_probability), true);
     appendResultCell(tr, "top_5_probability", formatPct(player.top_5_probability), true);
     appendResultCell(tr, "top_10_probability", formatPct(player.top_10_probability), true);
