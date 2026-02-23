@@ -25,7 +25,7 @@
         </p>
       </header>
 
-      <section class="card controls" aria-label="Simulation controls">
+      <section class="card controls automation-focused" aria-label="Simulation controls">
         <div class="field-grid">
           <label class="field">
             <span>Tour</span>
@@ -46,7 +46,7 @@
 
           <label class="field">
             <span>Simulations</span>
-            <input id="simulationsInput" type="number" min="500" max="250000" step="500" value="10000" />
+            <input id="simulationsInput" type="number" min="500" max="2000000" step="500" value="1000000" />
           </label>
 
           <label class="field">
@@ -89,16 +89,16 @@
           <label class="field">
             <span>Resolution Mode</span>
             <select id="resolutionModeSelect">
-              <option value="auto_target" selected>Auto Target</option>
-              <option value="fixed_cap">Fixed Cap</option>
+              <option value="auto_target">Auto Target</option>
+              <option value="fixed_cap" selected>Fixed Cap</option>
             </select>
           </label>
 
           <label class="field">
             <span>Use Adaptive Simulation</span>
             <select id="useAdaptiveSimulationSelect">
-              <option value="yes" selected>Yes</option>
-              <option value="no">No</option>
+              <option value="yes">Yes</option>
+              <option value="no" selected>No</option>
             </select>
           </label>
 
@@ -112,7 +112,7 @@
 
           <label class="field">
             <span>Min Simulations</span>
-            <input id="minSimulationsInput" type="number" min="500" max="250000" step="500" value="5000" />
+            <input id="minSimulationsInput" type="number" min="500" max="250000" step="500" value="250000" />
           </label>
 
           <label class="field">
@@ -123,14 +123,14 @@
               min="500"
               max="50000"
               step="500"
-              value="5000"
+              value="10000"
             />
           </label>
 
           <label class="field">
             <span>CI Confidence</span>
-            <input id="ciConfidenceInput" type="range" min="0.5" max="0.999" step="0.001" value="0.95" />
-            <output id="ciConfidenceValue">0.950</output>
+            <input id="ciConfidenceInput" type="range" min="0.5" max="0.999" step="0.001" value="0.975" />
+            <output id="ciConfidenceValue">0.975</output>
           </label>
 
           <label class="field">
@@ -141,13 +141,13 @@
               min="0.0001"
               max="0.05"
               step="0.0001"
-              value="0.0025"
+              value="0.0015"
             />
           </label>
 
           <label class="field">
             <span>CI Top-N</span>
-            <input id="ciTopNInput" type="number" min="1" max="50" value="10" />
+            <input id="ciTopNInput" type="number" min="1" max="50" value="15" />
           </label>
 
           <label class="field">
@@ -176,8 +176,8 @@
 
           <label class="field">
             <span>Current Season Weight</span>
-            <input id="currentSeasonWeightInput" type="range" min="0" max="1" step="0.01" value="0.6" />
-            <output id="currentSeasonWeightValue">0.60</output>
+            <input id="currentSeasonWeightInput" type="range" min="0" max="1" step="0.01" value="0.85" />
+            <output id="currentSeasonWeightValue">0.85</output>
           </label>
 
           <label class="field">
@@ -197,7 +197,7 @@
           </label>
         </div>
 
-        <div class="action-row">
+        <div class="action-row manual-controls">
           <button id="loadEventsButton" class="btn btn-secondary" type="button">Refresh Events</button>
           <button id="simulateButton" class="btn btn-primary" type="button">Run Simulation</button>
           <button id="syncLearningButton" class="btn btn-secondary" type="button">
@@ -205,6 +205,9 @@
           </button>
           <button id="refreshLearningButton" class="btn btn-secondary" type="button">
             Refresh Learning
+          </button>
+          <button id="runLifecycleButton" class="btn btn-secondary" type="button">
+            Run Lifecycle Now
           </button>
           <button
             id="applyRecommendationButton"
@@ -216,9 +219,50 @@
           </button>
         </div>
 
+        <div class="version-strip" aria-label="Model versions">
+          <article id="versionSimulationTile" class="version-tile">
+            <h3>Simulation Version</h3>
+            <p id="versionSimulationValue">v-</p>
+            <span id="versionSimulationMeta">No snapshot yet.</span>
+          </article>
+          <article id="versionRetrainTile" class="version-tile">
+            <h3>Retrain Version</h3>
+            <p id="versionRetrainValue">v0</p>
+            <span id="versionRetrainMeta">Not trained.</span>
+          </article>
+        </div>
+
         <p id="status" class="status idle">Ready.</p>
+        <p id="simulationAutomationStatus" class="status idle">
+          Simulation automation: initializing.
+        </p>
         <p id="formStatus" class="status idle"></p>
         <p id="learningStatus" class="status idle">Learning calibration: not trained yet.</p>
+        <p id="lifecycleStatus" class="status idle">Lifecycle: waiting for first automation cycle.</p>
+        <div class="automation-panel">
+          <h3>Automation Running</h3>
+          <p>
+            The app automatically runs three workflows: leakage-safe historical backfill training,
+            pre-event simulation snapshots, and post-event outcome sync + retraining.
+            Defaults are fixed for consistency: 1,000,000 simulations and 0.85 current-season weight.
+          </p>
+          <div class="table-wrap lifecycle-history-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Event</th>
+                  <th>Year</th>
+                  <th>State</th>
+                  <th>Sim Version</th>
+                  <th>Retrain Version</th>
+                  <th>Outcome Source</th>
+                  <th>Updated</th>
+                </tr>
+              </thead>
+              <tbody id="lifecycleHistoryBody"></tbody>
+            </table>
+          </div>
+        </div>
         <p id="error" class="error" hidden></p>
       </section>
 

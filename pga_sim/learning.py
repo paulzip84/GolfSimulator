@@ -13,6 +13,16 @@ import numpy as np
 
 _MARKETS = ("win", "top_3", "top_5", "top_10")
 _PROB_EPS = 1e-6
+_SNAPSHOT_TYPES = {"manual", "live", "pre_event"}
+_LIFECYCLE_STATES = {
+    "scheduled",
+    "pre_event_snapshot_taken",
+    "in_play",
+    "complete",
+    "awaiting_official",
+    "outcomes_synced",
+    "retrained",
+}
 
 
 @dataclass(frozen=True)
@@ -79,6 +89,7 @@ class LearningStore:
                   event_year INTEGER,
                   event_date TEXT,
                   simulation_version INTEGER NOT NULL DEFAULT 1,
+                  snapshot_type TEXT NOT NULL DEFAULT 'manual',
                   requested_simulations INTEGER,
                   simulations INTEGER,
                   enable_in_play INTEGER NOT NULL DEFAULT 1,
@@ -131,12 +142,30 @@ class LearningStore:
                   PRIMARY KEY (tour, market)
                 );
 
+                CREATE TABLE IF NOT EXISTS event_lifecycle (
+                  tour TEXT NOT NULL,
+                  event_id TEXT NOT NULL,
+                  event_year INTEGER NOT NULL,
+                  event_name TEXT,
+                  event_date TEXT,
+                  state TEXT NOT NULL DEFAULT 'scheduled',
+                  pre_event_run_id TEXT,
+                  pre_event_simulation_version INTEGER,
+                  outcomes_source TEXT,
+                  retrain_version INTEGER,
+                  updated_at TEXT NOT NULL,
+                  last_note TEXT,
+                  PRIMARY KEY (tour, event_id, event_year)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_simulation_runs_event
                   ON simulation_runs (tour, event_id, event_year, created_at);
                 CREATE INDEX IF NOT EXISTS idx_outcomes_event
                   ON event_outcomes (tour, event_id, event_year);
                 CREATE INDEX IF NOT EXISTS idx_simulation_players_key
                   ON simulation_players (player_key);
+                CREATE INDEX IF NOT EXISTS idx_event_lifecycle_recent
+                  ON event_lifecycle (tour, updated_at DESC);
                 """
             )
             if not _table_has_column(conn, "simulation_runs", "simulation_version"):
@@ -153,6 +182,21 @@ class LearningStore:
                 WHERE simulation_version IS NULL
                 """
             )
+            if not _table_has_column(conn, "simulation_runs", "snapshot_type"):
+                conn.execute(
+                    """
+                    ALTER TABLE simulation_runs
+                    ADD COLUMN snapshot_type TEXT NOT NULL DEFAULT 'manual'
+                    """
+                )
+            conn.execute(
+                """
+                UPDATE simulation_runs
+                SET snapshot_type = 'manual'
+                WHERE snapshot_type IS NULL OR trim(snapshot_type) = ''
+                """
+            )
+            _reconcile_event_year_mismatches(conn)
             conn.commit()
 
     @staticmethod
@@ -193,6 +237,7 @@ class LearningStore:
         simulations: int | None,
         enable_in_play: bool,
         in_play_applied: bool,
+        snapshot_type: str = "manual",
         simulation_version: int | None = None,
         players: list[dict[str, Any]],
     ) -> tuple[str, int]:
@@ -201,6 +246,7 @@ class LearningStore:
 
         normalized_tour = self._normalize_tour(tour)
         normalized_event_id = _normalize_token(event_id)
+        normalized_snapshot_type = _normalize_snapshot_type(snapshot_type)
         run_id = str(uuid.uuid4())
         created_at = datetime.now(timezone.utc).isoformat()
 
@@ -226,8 +272,8 @@ class LearningStore:
                 """
                 INSERT INTO simulation_runs (
                   run_id, created_at, tour, event_id, event_name, event_year, event_date,
-                  simulation_version, requested_simulations, simulations, enable_in_play, in_play_applied
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  simulation_version, snapshot_type, requested_simulations, simulations, enable_in_play, in_play_applied
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -238,6 +284,7 @@ class LearningStore:
                     event_year,
                     event_date,
                     resolved_simulation_version,
+                    normalized_snapshot_type,
                     requested_simulations,
                     simulations,
                     int(enable_in_play),
@@ -273,6 +320,29 @@ class LearningStore:
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     player_rows,
+                )
+
+            if normalized_event_id and event_year is not None:
+                lifecycle_state = "scheduled"
+                if normalized_snapshot_type == "pre_event":
+                    lifecycle_state = "pre_event_snapshot_taken"
+                elif in_play_applied or normalized_snapshot_type == "live":
+                    lifecycle_state = "in_play"
+
+                self._upsert_event_lifecycle_locked(
+                    conn=conn,
+                    tour=normalized_tour,
+                    event_id=normalized_event_id,
+                    event_year=int(event_year),
+                    event_name=event_name,
+                    event_date=event_date,
+                    state=lifecycle_state,
+                    pre_event_run_id=run_id if normalized_snapshot_type == "pre_event" else None,
+                    pre_event_simulation_version=(
+                        int(resolved_simulation_version)
+                        if normalized_snapshot_type == "pre_event"
+                        else None
+                    ),
                 )
             conn.commit()
 
@@ -345,11 +415,253 @@ class LearningStore:
         ).fetchone()
         return int(row[0] or 0) + 1
 
+    def _upsert_event_lifecycle_locked(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        tour: str,
+        event_id: str,
+        event_year: int,
+        event_name: str | None = None,
+        event_date: str | None = None,
+        state: str | None = None,
+        pre_event_run_id: str | None = None,
+        pre_event_simulation_version: int | None = None,
+        outcomes_source: str | None = None,
+        retrain_version: int | None = None,
+        last_note: str | None = None,
+    ) -> None:
+        normalized_state = _normalize_lifecycle_state(state)
+        existing = conn.execute(
+            """
+            SELECT *
+            FROM event_lifecycle
+            WHERE tour = ? AND event_id = ? AND event_year = ?
+            """,
+            (tour, event_id, int(event_year)),
+        ).fetchone()
+        now_text = datetime.now(timezone.utc).isoformat()
+        if existing is None:
+            row = {
+                "tour": tour,
+                "event_id": event_id,
+                "event_year": int(event_year),
+                "event_name": event_name,
+                "event_date": event_date,
+                "state": normalized_state or "scheduled",
+                "pre_event_run_id": pre_event_run_id,
+                "pre_event_simulation_version": pre_event_simulation_version,
+                "outcomes_source": outcomes_source,
+                "retrain_version": retrain_version,
+                "updated_at": now_text,
+                "last_note": last_note,
+            }
+        else:
+            row = {
+                "tour": str(existing["tour"]),
+                "event_id": str(existing["event_id"]),
+                "event_year": int(existing["event_year"]),
+                "event_name": existing["event_name"],
+                "event_date": existing["event_date"],
+                "state": existing["state"] or "scheduled",
+                "pre_event_run_id": existing["pre_event_run_id"],
+                "pre_event_simulation_version": existing["pre_event_simulation_version"],
+                "outcomes_source": existing["outcomes_source"],
+                "retrain_version": existing["retrain_version"],
+                "updated_at": now_text,
+                "last_note": existing["last_note"],
+            }
+
+            if event_name is not None:
+                row["event_name"] = event_name
+            if event_date is not None:
+                row["event_date"] = event_date
+            if normalized_state is not None:
+                row["state"] = normalized_state
+            if pre_event_run_id is not None:
+                row["pre_event_run_id"] = pre_event_run_id
+            if pre_event_simulation_version is not None:
+                row["pre_event_simulation_version"] = int(pre_event_simulation_version)
+            if outcomes_source is not None:
+                row["outcomes_source"] = str(outcomes_source).strip().lower()
+            if retrain_version is not None:
+                row["retrain_version"] = int(retrain_version)
+            if last_note is not None:
+                row["last_note"] = last_note
+
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO event_lifecycle (
+              tour, event_id, event_year, event_name, event_date, state,
+              pre_event_run_id, pre_event_simulation_version,
+              outcomes_source, retrain_version, updated_at, last_note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["tour"],
+                row["event_id"],
+                row["event_year"],
+                row["event_name"],
+                row["event_date"],
+                row["state"],
+                row["pre_event_run_id"],
+                row["pre_event_simulation_version"],
+                row["outcomes_source"],
+                row["retrain_version"],
+                row["updated_at"],
+                row["last_note"],
+            ),
+        )
+
+    def upsert_event_lifecycle(
+        self,
+        *,
+        tour: str,
+        event_id: str | None,
+        event_year: int | None,
+        event_name: str | None = None,
+        event_date: str | None = None,
+        state: str | None = None,
+        pre_event_run_id: str | None = None,
+        pre_event_simulation_version: int | None = None,
+        outcomes_source: str | None = None,
+        retrain_version: int | None = None,
+        last_note: str | None = None,
+    ) -> None:
+        normalized_tour = self._normalize_tour(tour)
+        normalized_event_id = _normalize_token(event_id)
+        if not normalized_event_id:
+            return
+
+        resolved_year = event_year
+        if resolved_year is None:
+            resolved_year = _year_from_date(event_date)
+        if resolved_year is None:
+            return
+
+        with self._lock, self._connect() as conn:
+            self._upsert_event_lifecycle_locked(
+                conn=conn,
+                tour=normalized_tour,
+                event_id=normalized_event_id,
+                event_year=int(resolved_year),
+                event_name=event_name,
+                event_date=event_date,
+                state=state,
+                pre_event_run_id=pre_event_run_id,
+                pre_event_simulation_version=pre_event_simulation_version,
+                outcomes_source=outcomes_source,
+                retrain_version=retrain_version,
+                last_note=last_note,
+            )
+            conn.commit()
+
+    def get_pre_event_snapshot(
+        self,
+        *,
+        tour: str,
+        event_id: str | None,
+        event_year: int | None,
+    ) -> dict[str, Any] | None:
+        normalized_tour = self._normalize_tour(tour)
+        normalized_event_id = _normalize_token(event_id)
+        if not normalized_event_id or event_year is None:
+            return None
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT run_id, created_at, simulation_version
+                FROM simulation_runs
+                WHERE tour = ?
+                  AND event_id = ?
+                  AND event_year = ?
+                  AND snapshot_type = 'pre_event'
+                ORDER BY simulation_version DESC, created_at DESC
+                LIMIT 1
+                """,
+                (normalized_tour, normalized_event_id, int(event_year)),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "run_id": str(row["run_id"]),
+            "created_at": _parse_iso_datetime(row["created_at"]),
+            "simulation_version": int(row["simulation_version"] or 1),
+        }
+
+    def list_event_lifecycle(
+        self,
+        *,
+        tour: str = "pga",
+        max_events: int = 20,
+        min_event_year: int | None = None,
+        max_event_year: int | None = None,
+    ) -> list[dict[str, Any]]:
+        normalized_tour = self._normalize_tour(tour)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  tour,
+                  event_id,
+                  event_year,
+                  event_name,
+                  event_date,
+                  state,
+                  pre_event_simulation_version,
+                  outcomes_source,
+                  retrain_version,
+                  updated_at,
+                  last_note
+                FROM event_lifecycle
+                WHERE tour = ?
+                  AND (? IS NULL OR event_year >= ?)
+                  AND (? IS NULL OR event_year <= ?)
+                ORDER BY updated_at DESC, event_year DESC, event_id DESC
+                LIMIT ?
+                """,
+                (
+                    normalized_tour,
+                    min_event_year,
+                    min_event_year,
+                    max_event_year,
+                    max_event_year,
+                    max(1, int(max_events)),
+                ),
+            ).fetchall()
+
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "tour": str(row["tour"]),
+                    "event_id": str(row["event_id"]),
+                    "event_year": int(row["event_year"]),
+                    "event_name": row["event_name"],
+                    "event_date": row["event_date"],
+                    "state": str(row["state"] or "scheduled"),
+                    "pre_event_snapshot_version": (
+                        int(row["pre_event_simulation_version"])
+                        if row["pre_event_simulation_version"] is not None
+                        else None
+                    ),
+                    "outcomes_source": row["outcomes_source"],
+                    "retrain_version": (
+                        int(row["retrain_version"]) if row["retrain_version"] is not None else None
+                    ),
+                    "updated_at": _parse_iso_datetime(row["updated_at"]),
+                    "last_note": row["last_note"],
+                }
+            )
+        return out
+
     def list_pending_events(
         self,
         *,
         tour: str | None = None,
         max_events: int = 40,
+        min_event_year: int | None = None,
+        max_event_year: int | None = None,
     ) -> list[PendingOutcomeEvent]:
         normalized_tour = self._normalize_tour(tour or "pga") if tour else None
         current_year = datetime.now(timezone.utc).year
@@ -365,6 +677,8 @@ class LearningStore:
             WHERE r.event_id IS NOT NULL
               AND r.event_year IS NOT NULL
               AND r.event_year <= ?
+              AND (? IS NULL OR r.event_year >= ?)
+              AND (? IS NULL OR r.event_year <= ?)
               AND (r.event_date IS NULL OR substr(r.event_date, 1, 10) <= ?)
               AND (? IS NULL OR r.tour = ?)
               AND NOT EXISTS (
@@ -384,6 +698,10 @@ class LearningStore:
                 sql,
                 (
                     current_year,
+                    min_event_year,
+                    min_event_year,
+                    max_event_year,
+                    max_event_year,
                     today_text,
                     normalized_tour,
                     normalized_tour,
@@ -409,6 +727,7 @@ class LearningStore:
         event_id: str,
         event_year: int,
         payload: Any,
+        outcomes_source: str | None = None,
     ) -> int:
         normalized_tour = self._normalize_tour(tour)
         normalized_event_id = _normalize_token(event_id)
@@ -468,6 +787,20 @@ class LearningStore:
                 """,
                 outcome_rows,
             )
+            self._upsert_event_lifecycle_locked(
+                conn=conn,
+                tour=normalized_tour,
+                event_id=normalized_event_id,
+                event_year=int(event_year),
+                event_name=event_name,
+                event_date=completed,
+                state="outcomes_synced",
+                outcomes_source=(
+                    str(outcomes_source).strip().lower()
+                    if outcomes_source is not None
+                    else None
+                ),
+            )
             conn.commit()
         return len(outcome_rows)
 
@@ -512,11 +845,34 @@ class LearningStore:
             markets=markets,
         )
 
-    def retrain(self, *, tour: str, bump_version: bool = True) -> LearningSnapshot:
+    def retrain(
+        self,
+        *,
+        tour: str,
+        bump_version: bool = True,
+        min_event_year: int | None = None,
+        max_event_year: int | None = None,
+        reset_if_empty: bool = False,
+    ) -> LearningSnapshot:
         normalized_tour = self._normalize_tour(tour)
         current_snapshot = self.get_snapshot(tour=normalized_tour)
-        observations = self._load_training_rows(tour=normalized_tour)
+        observations = self._load_training_rows(
+            tour=normalized_tour,
+            min_event_year=min_event_year,
+            max_event_year=max_event_year,
+        )
         if not observations:
+            if reset_if_empty:
+                with self._lock, self._connect() as conn:
+                    conn.execute(
+                        """
+                        DELETE FROM calibration_state
+                        WHERE tour = ?
+                        """,
+                        (normalized_tour,),
+                    )
+                    conn.commit()
+                return self.get_snapshot(tour=normalized_tour)
             return current_snapshot
 
         if bump_version:
@@ -546,6 +902,24 @@ class LearningStore:
             brier_after = _brier_score(calibrated, labels) if samples > 0 else None
             logloss_before = _logloss(probs, labels) if samples > 0 else None
             logloss_after = _logloss(calibrated, labels) if samples > 0 else None
+
+            # Safety rail: never persist a calibration that materially degrades error metrics.
+            if (
+                samples > 0
+                and brier_before is not None
+                and brier_after is not None
+                and logloss_before is not None
+                and logloss_after is not None
+                and (
+                    brier_after > (brier_before + 1e-6)
+                    or logloss_after > (logloss_before + 1e-6)
+                )
+            ):
+                alpha = 0.0
+                beta = 1.0
+                calibrated = np.clip(probs, _PROB_EPS, 1.0 - _PROB_EPS)
+                brier_after = _brier_score(calibrated, labels)
+                logloss_after = _logloss(calibrated, labels)
 
             calibration_rows.append(
                 (
@@ -578,13 +952,31 @@ class LearningStore:
 
         return self.get_snapshot(tour=normalized_tour)
 
-    def status(self, *, tour: str) -> dict[str, Any]:
+    def status(
+        self,
+        *,
+        tour: str,
+        min_event_year: int | None = None,
+        max_event_year: int | None = None,
+    ) -> dict[str, Any]:
         normalized_tour = self._normalize_tour(tour)
         with self._lock, self._connect() as conn:
             predictions_logged = int(
                 conn.execute(
-                    "SELECT COUNT(*) FROM simulation_runs WHERE tour = ?",
-                    (normalized_tour,),
+                    """
+                    SELECT COUNT(*)
+                    FROM simulation_runs
+                    WHERE tour = ?
+                      AND (? IS NULL OR event_year >= ?)
+                      AND (? IS NULL OR event_year <= ?)
+                    """,
+                    (
+                        normalized_tour,
+                        min_event_year,
+                        min_event_year,
+                        max_event_year,
+                        max_event_year,
+                    ),
                 ).fetchone()[0]
             )
             resolved_events = int(
@@ -595,9 +987,17 @@ class LearningStore:
                       SELECT DISTINCT event_id, event_year
                       FROM event_outcomes
                       WHERE tour = ?
+                        AND (? IS NULL OR event_year >= ?)
+                        AND (? IS NULL OR event_year <= ?)
                     )
                     """,
-                    (normalized_tour,),
+                    (
+                        normalized_tour,
+                        min_event_year,
+                        min_event_year,
+                        max_event_year,
+                        max_event_year,
+                    ),
                 ).fetchone()[0]
             )
             pending_events = int(
@@ -610,6 +1010,8 @@ class LearningStore:
                       WHERE r.tour = ?
                         AND r.event_id IS NOT NULL
                         AND r.event_year IS NOT NULL
+                        AND (? IS NULL OR r.event_year >= ?)
+                        AND (? IS NULL OR r.event_year <= ?)
                         AND (r.event_date IS NULL OR substr(r.event_date, 1, 10) <= ?)
                         AND NOT EXISTS (
                           SELECT 1
@@ -620,22 +1022,44 @@ class LearningStore:
                         )
                     )
                     """,
-                    (normalized_tour, datetime.now(timezone.utc).date().isoformat()),
+                    (
+                        normalized_tour,
+                        min_event_year,
+                        min_event_year,
+                        max_event_year,
+                        max_event_year,
+                        datetime.now(timezone.utc).date().isoformat(),
+                    ),
                 ).fetchone()[0]
             )
 
-        training_rows = self._load_training_rows(tour=normalized_tour)
+        training_rows = self._load_training_rows(
+            tour=normalized_tour,
+            min_event_year=min_event_year,
+            max_event_year=max_event_year,
+        )
+        resolved_predictions = len(training_rows)
         snapshot = self.get_snapshot(tour=normalized_tour)
-        markets = [snapshot.markets.get(market, CalibrationMetrics(market=market)) for market in _MARKETS]
+        if resolved_predictions > 0:
+            markets = [
+                snapshot.markets.get(market, CalibrationMetrics(market=market))
+                for market in _MARKETS
+            ]
+            calibration_version = snapshot.version
+            calibration_updated_at = snapshot.updated_at
+        else:
+            markets = [CalibrationMetrics(market=market) for market in _MARKETS]
+            calibration_version = 0
+            calibration_updated_at = None
 
         return {
             "tour": normalized_tour,
             "predictions_logged": predictions_logged,
-            "resolved_predictions": len(training_rows),
+            "resolved_predictions": resolved_predictions,
             "resolved_events": resolved_events,
             "pending_events": pending_events,
-            "calibration_version": snapshot.version,
-            "calibration_updated_at": snapshot.updated_at,
+            "calibration_version": calibration_version,
+            "calibration_updated_at": calibration_updated_at,
             "markets": markets,
         }
 
@@ -691,6 +1115,7 @@ class LearningStore:
                   run_id,
                   created_at,
                   simulation_version,
+                  snapshot_type,
                   simulations,
                   in_play_applied,
                   event_name
@@ -737,7 +1162,8 @@ class LearningStore:
                   sp.top5_prob AS top5_prob,
                   sp.top10_prob AS top10_prob,
                   r.created_at AS created_at,
-                  r.simulation_version AS simulation_version
+                  r.simulation_version AS simulation_version,
+                  r.snapshot_type AS snapshot_type
                 FROM simulation_players sp
                 JOIN simulation_runs r
                   ON r.run_id = sp.run_id
@@ -752,6 +1178,7 @@ class LearningStore:
                 "run_id": str(row["run_id"]),
                 "created_at": _parse_iso_datetime(row["created_at"]),
                 "simulation_version": int(row["simulation_version"] or 1),
+                "snapshot_type": _normalize_snapshot_type(row["snapshot_type"]),
                 "simulations": int(row["simulations"]) if row["simulations"] is not None else None,
                 "in_play_applied": bool(int(row["in_play_applied"])),
             }
@@ -774,6 +1201,7 @@ class LearningStore:
                 "run_id": str(row["run_id"]),
                 "created_at": _parse_iso_datetime(row["created_at"]),
                 "simulation_version": int(row["simulation_version"] or 1),
+                "snapshot_type": _normalize_snapshot_type(row["snapshot_type"]),
                 "win_probability": float(row["win_prob"]),
                 "top_3_probability": float(row["top3_prob"]),
                 "top_5_probability": float(row["top5_prob"]),
@@ -857,7 +1285,13 @@ class LearningStore:
             "players": players_payload,
         }
 
-    def _load_training_rows(self, *, tour: str) -> list[dict[str, Any]]:
+    def _load_training_rows(
+        self,
+        *,
+        tour: str,
+        min_event_year: int | None = None,
+        max_event_year: int | None = None,
+    ) -> list[dict[str, Any]]:
         sql = """
             WITH candidate AS (
               SELECT
@@ -881,6 +1315,8 @@ class LearningStore:
               WHERE r.tour = ?
                 AND r.event_id IS NOT NULL
                 AND r.event_year IS NOT NULL
+                AND (? IS NULL OR r.event_year >= ?)
+                AND (? IS NULL OR r.event_year <= ?)
             )
             SELECT
               c.win_prob AS win_prob,
@@ -901,7 +1337,16 @@ class LearningStore:
         """
 
         with self._lock, self._connect() as conn:
-            rows = conn.execute(sql, (tour,)).fetchall()
+            rows = conn.execute(
+                sql,
+                (
+                    tour,
+                    min_event_year,
+                    min_event_year,
+                    max_event_year,
+                    max_event_year,
+                ),
+            ).fetchall()
 
         return [
             {
@@ -1145,6 +1590,135 @@ def _parse_iso_datetime(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _normalize_snapshot_type(value: Any) -> str:
+    if value is None:
+        return "manual"
+    text = str(value).strip().lower()
+    if text in _SNAPSHOT_TYPES:
+        return text
+    return "manual"
+
+
+def _normalize_lifecycle_state(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in _LIFECYCLE_STATES:
+        return text
+    return None
+
+
+def _reconcile_event_year_mismatches(conn: sqlite3.Connection) -> None:
+    # Normalize historical rows that were previously keyed to season year instead
+    # of calendar year when date fields clearly indicate the calendar year.
+    run_rows = conn.execute(
+        """
+        SELECT run_id, event_year, event_date
+        FROM simulation_runs
+        WHERE event_year IS NOT NULL
+          AND event_date IS NOT NULL
+          AND length(event_date) >= 4
+        """
+    ).fetchall()
+    for row in run_rows:
+        event_date_year = _year_from_date(row["event_date"])
+        if event_date_year is None:
+            continue
+        old_year = int(row["event_year"])
+        if old_year == event_date_year:
+            continue
+        conn.execute(
+            """
+            UPDATE simulation_runs
+            SET event_year = ?
+            WHERE run_id = ?
+            """,
+            (int(event_date_year), str(row["run_id"])),
+        )
+
+    outcome_rows = conn.execute(
+        """
+        SELECT DISTINCT tour, event_id, event_year, event_completed
+        FROM event_outcomes
+        WHERE event_year IS NOT NULL
+          AND event_completed IS NOT NULL
+          AND length(event_completed) >= 4
+        """
+    ).fetchall()
+    for row in outcome_rows:
+        completed_year = _year_from_date(row["event_completed"])
+        if completed_year is None:
+            continue
+        old_year = int(row["event_year"])
+        if old_year == completed_year:
+            continue
+        collision = conn.execute(
+            """
+            SELECT 1
+            FROM event_outcomes
+            WHERE tour = ? AND event_id = ? AND event_year = ?
+            LIMIT 1
+            """,
+            (str(row["tour"]), str(row["event_id"]), int(completed_year)),
+        ).fetchone()
+        if collision is not None:
+            continue
+        conn.execute(
+            """
+            UPDATE event_outcomes
+            SET event_year = ?
+            WHERE tour = ? AND event_id = ? AND event_year = ?
+            """,
+            (
+                int(completed_year),
+                str(row["tour"]),
+                str(row["event_id"]),
+                int(old_year),
+            ),
+        )
+
+    lifecycle_rows = conn.execute(
+        """
+        SELECT tour, event_id, event_year, event_date
+        FROM event_lifecycle
+        WHERE event_year IS NOT NULL
+          AND event_date IS NOT NULL
+          AND length(event_date) >= 4
+        """
+    ).fetchall()
+    for row in lifecycle_rows:
+        event_date_year = _year_from_date(row["event_date"])
+        if event_date_year is None:
+            continue
+        old_year = int(row["event_year"])
+        if old_year == event_date_year:
+            continue
+        collision = conn.execute(
+            """
+            SELECT 1
+            FROM event_lifecycle
+            WHERE tour = ? AND event_id = ? AND event_year = ?
+            LIMIT 1
+            """,
+            (str(row["tour"]), str(row["event_id"]), int(event_date_year)),
+        ).fetchone()
+        if collision is not None:
+            continue
+        conn.execute(
+            """
+            UPDATE event_lifecycle
+            SET event_year = ?
+            WHERE tour = ? AND event_id = ? AND event_year = ?
+            """,
+            (
+                int(event_date_year),
+                str(row["tour"]),
+                str(row["event_id"]),
+                int(old_year),
+            ),
+        )
 
 
 def _table_has_column(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:

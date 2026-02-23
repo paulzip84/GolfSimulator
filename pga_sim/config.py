@@ -1,4 +1,5 @@
 from functools import lru_cache
+from datetime import datetime, timezone
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -7,7 +8,7 @@ class Settings(BaseSettings):
     datagolf_api_key: str = ""
     datagolf_base_url: str = "https://feeds.datagolf.com"
     http_timeout_seconds: float = 20.0
-    default_simulations: int = 10_000
+    default_simulations: int = 1_000_000
     learning_database_path: str = ".pga_sim_learning.sqlite3"
     app_auth_mode: str = "none"
     app_auth_exempt_paths: str = "/health"
@@ -23,6 +24,15 @@ class Settings(BaseSettings):
     auth_admin_subjects: str = ""
     cloudflare_access_team_domain: str = ""
     cloudflare_access_audience: str = ""
+    lifecycle_automation_enabled: bool = True
+    lifecycle_automation_interval_seconds: int = 600
+    lifecycle_tour: str = "pga"
+    lifecycle_pre_event_simulations: int = 1_000_000
+    lifecycle_pre_event_seed: int = 20260223
+    lifecycle_sync_max_events: int = 40
+    lifecycle_backfill_enabled: bool = True
+    lifecycle_backfill_batch_size: int = 25
+    lifecycle_target_year: int = datetime.now(timezone.utc).year
 
     model_config = SettingsConfigDict(
         env_file=".env",

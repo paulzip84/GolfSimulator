@@ -11,6 +11,10 @@ Outputs are player-by-player probabilities for:
 - `top_5`
 - `top_10`
 
+Defaults now prioritize high-resolution automation:
+- `simulations=1,000,000`
+- `current_season_weight=0.85`
+
 ## Architecture
 
 - `pga_sim/datagolf_client.py`: DataGolf API client.
@@ -131,6 +135,8 @@ Endpoints:
 - `GET /learning/status?tour=pga`
 - `POST /learning/sync-train`
 - `GET /learning/event-trends?tour=pga&event_id=14`
+- `GET /lifecycle/status?tour=pga`
+- `POST /lifecycle/run?tour=pga`
 
 When auth is enabled:
 - `POST /learning/sync-train` requires `admin` role.
@@ -143,7 +149,9 @@ curl -X POST "http://127.0.0.1:8000/simulate" \
   -H "Content-Type: application/json" \
   -d '{
     "tour": "pga",
+    "resolution_mode": "fixed_cap",
     "simulations": 20000,
+    "enable_adaptive_simulation": false,
     "seed": 123,
     "cut_size": 70,
     "mean_reversion": 0.1,
@@ -151,7 +159,7 @@ curl -X POST "http://127.0.0.1:8000/simulate" \
     "baseline_season": 2025,
     "current_season": 2026,
     "seasonal_form_weight": 0.35,
-    "current_season_weight": 0.6,
+    "current_season_weight": 0.85,
     "form_delta_weight": 0.25
   }'
 ```
@@ -185,9 +193,27 @@ curl -X POST "http://127.0.0.1:8000/simulate" \
 - Live probability movement:
   - Enable `Live Auto-Refresh` in the GUI to rerun in-play conditioned simulations on a cadence.
   - Expanded player rows show win-probability trend snapshots and deltas over the tournament.
+- High-resolution defaults:
+  - `resolution_mode=fixed_cap`
+  - `simulations=1,000,000` cap
+  - `min_simulations=250,000` (used when you switch to `auto_target`)
+  - `ci_confidence=0.975`
+  - `ci_half_width_target=0.0015`
+  - `ci_top_n=15`
 - Simulation snapshot versioning:
   - Every logged run stores an event-scoped `simulation_version` that increments per event-year (`v1`, `v2`, ...).
   - Versions are shown in the GUI summary card and trend snapshots to support pre-round vs. final-outcome review.
+- Lifecycle automation (new):
+  - A background lifecycle worker can automatically:
+    - run leakage-safe historical backfill simulation + training in chronological order,
+    - capture one consistent pre-event snapshot for the active event (snapshot type `pre_event`),
+    - capture live in-play snapshots for the active event while play is ongoing,
+    - sync outcomes when events complete,
+    - retrain calibration when new outcomes are available.
+  - Lifecycle status is visible in the GUI and through `/lifecycle/status`.
+  - Manual override is available with `POST /lifecycle/run`.
+  - The GUI now defaults to automation-focused mode (historical timeline + automation status, fewer manual controls).
+  - The GUI auto-runs scheduled simulations on a cadence and shows explicit automation run status.
 
 ## Secure web deployment (recommended)
 
@@ -210,6 +236,15 @@ Deploying for friends is easiest with:
    - `APP_AUTH_BASIC_USERNAME=<your-username>`
    - `APP_AUTH_BASIC_PASSWORD=<long-random-password>`
    - `APP_AUTH_BASIC_ROLE=admin`
+   - optional lifecycle automation controls:
+     - `LIFECYCLE_AUTOMATION_ENABLED=true`
+     - `LIFECYCLE_AUTOMATION_INTERVAL_SECONDS=600`
+     - `LIFECYCLE_TOUR=pga`
+     - `LIFECYCLE_PRE_EVENT_SIMULATIONS=1000000`
+     - `LIFECYCLE_PRE_EVENT_SEED=20260223`
+     - `LIFECYCLE_SYNC_MAX_EVENTS=40`
+     - `LIFECYCLE_BACKFILL_ENABLED=true`
+     - `LIFECYCLE_BACKFILL_BATCH_SIZE=25`
 
 ### Basic Auth quick start (no custom domain required)
 

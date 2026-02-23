@@ -3,11 +3,15 @@ const state = {
   latestResult: null,
   expandedPlayerKey: null,
   latestLearningStatus: null,
+  latestLifecycleStatus: null,
   eventTrends: null,
   trendPlayerByKey: {},
   autoRefreshTimerId: null,
+  autoSimulationTimerId: null,
+  lifecyclePollTimerId: null,
   simulationInFlight: false,
 };
+const AUTOMATION_SIMULATION_INTERVAL_SECONDS = 120;
 
 const TABLE_TOOLTIPS = {
   rank: {
@@ -109,7 +113,7 @@ const CONTROL_TOOLTIPS = {
   liveRefreshSecondsInput:
     "Seconds between automatic simulation refreshes when Live Auto-Refresh is enabled.",
   resolutionModeSelect:
-    "Auto Target: stop when CI precision target is met; Fixed Cap: always run exactly Simulations.",
+    "Auto Target: stop when CI precision target is met; Fixed Cap: always run exactly Simulations (default for maximum resolution).",
   minSimulationsInput:
     "Minimum simulations to run before adaptive early-stop is allowed. If this is above Simulations, it is effectively capped at Simulations.",
   simulationBatchSizeInput:
@@ -121,7 +125,7 @@ const CONTROL_TOOLTIPS = {
   sharedRoundShockInput:
     "Common round shock applied to all players each round (weather/course day effect correlation).",
   useAdaptiveSimulationSelect:
-    "If enabled, simulation can stop early once top-N win probability confidence intervals are narrow enough.",
+    "If enabled, simulation can stop early once top-N win probability confidence intervals are narrow enough (ignored in Fixed Cap mode).",
   ciConfidenceInput:
     "Confidence level for adaptive stopping (for example 0.95). Higher confidence usually requires more simulations.",
   ciHalfWidthTargetInput:
@@ -150,6 +154,8 @@ const CONTROL_TOOLTIPS = {
     "Fetch outcomes for previously predicted events from DataGolf historical endpoints, then retrain calibration.",
   refreshLearningButton:
     "Reload learning stats without retraining.",
+  runLifecycleButton:
+    "Run one lifecycle automation cycle now (pre-event snapshot + outcome sync/retrain checks).",
 };
 
 const ui = {
@@ -187,21 +193,31 @@ const ui = {
   simulateButton: document.getElementById("simulateButton"),
   syncLearningButton: document.getElementById("syncLearningButton"),
   refreshLearningButton: document.getElementById("refreshLearningButton"),
+  runLifecycleButton: document.getElementById("runLifecycleButton"),
   applyRecommendationButton: document.getElementById("applyRecommendationButton"),
   status: document.getElementById("status"),
   formStatus: document.getElementById("formStatus"),
   learningStatus: document.getElementById("learningStatus"),
+  simulationAutomationStatus: document.getElementById("simulationAutomationStatus"),
+  lifecycleStatus: document.getElementById("lifecycleStatus"),
   error: document.getElementById("error"),
   resultsSection: document.getElementById("resultsSection"),
   eventLabel: document.getElementById("eventLabel"),
   simLabel: document.getElementById("simLabel"),
   snapshotLabel: document.getElementById("snapshotLabel"),
+  versionSimulationTile: document.getElementById("versionSimulationTile"),
+  versionSimulationValue: document.getElementById("versionSimulationValue"),
+  versionSimulationMeta: document.getElementById("versionSimulationMeta"),
+  versionRetrainTile: document.getElementById("versionRetrainTile"),
+  versionRetrainValue: document.getElementById("versionRetrainValue"),
+  versionRetrainMeta: document.getElementById("versionRetrainMeta"),
   generatedLabel: document.getElementById("generatedLabel"),
   winnerLabel: document.getElementById("winnerLabel"),
   seasonWindowLabel: document.getElementById("seasonWindowLabel"),
   calibrationLabel: document.getElementById("calibrationLabel"),
   winChart: document.getElementById("winChart"),
   resultsBody: document.getElementById("resultsBody"),
+  lifecycleHistoryBody: document.getElementById("lifecycleHistoryBody"),
 };
 
 function setStatus(text, running = false) {
@@ -232,6 +248,24 @@ function setLearningStatus(message = "", running = false) {
   ui.learningStatus.classList.toggle("idle", !running);
 }
 
+function setSimulationAutomationStatus(message = "", running = false) {
+  if (!ui.simulationAutomationStatus) {
+    return;
+  }
+  ui.simulationAutomationStatus.textContent = message;
+  ui.simulationAutomationStatus.classList.toggle("running", running);
+  ui.simulationAutomationStatus.classList.toggle("idle", !running);
+}
+
+function setLifecycleStatus(message = "", running = false) {
+  if (!ui.lifecycleStatus) {
+    return;
+  }
+  ui.lifecycleStatus.textContent = message;
+  ui.lifecycleStatus.classList.toggle("running", running);
+  ui.lifecycleStatus.classList.toggle("idle", !running);
+}
+
 function setBusy(isBusy) {
   ui.simulateButton.disabled = isBusy;
   ui.loadEventsButton.disabled = isBusy;
@@ -246,6 +280,9 @@ function setBusy(isBusy) {
   }
   if (ui.refreshLearningButton) {
     ui.refreshLearningButton.disabled = isBusy;
+  }
+  if (ui.runLifecycleButton) {
+    ui.runLifecycleButton.disabled = isBusy;
   }
   if (ui.applyRecommendationButton) {
     ui.applyRecommendationButton.disabled = isBusy;
@@ -268,6 +305,13 @@ function formatDate(dateValue) {
     return String(dateValue);
   }
   return parsed.toLocaleString();
+}
+
+function formatLifecycleState(state) {
+  if (!state) {
+    return "-";
+  }
+  return String(state).replace(/_/g, " ");
 }
 
 function formatMetric(value) {
@@ -423,16 +467,137 @@ function findMarketStatus(payload, marketName) {
   return payload.markets.find((market) => market.market === marketName) || null;
 }
 
+function updateVersionCallouts() {
+  if (ui.versionSimulationValue) {
+    let simValue = "v-";
+    let simMeta = "No snapshot yet.";
+    if (
+      state.latestResult &&
+      Number.isFinite(Number(state.latestResult.simulation_version))
+    ) {
+      simValue = `v${Number(state.latestResult.simulation_version)}`;
+      const eventLabel = state.latestResult.event_name || state.latestResult.event_id || "Latest event";
+      simMeta = `${eventLabel} | ${formatDate(state.latestResult.generated_at)}`;
+    } else if (
+      state.latestLifecycleStatus &&
+      state.latestLifecycleStatus.pre_event_snapshot_version != null
+    ) {
+      simValue = `v${Number(state.latestLifecycleStatus.pre_event_snapshot_version)}`;
+      const eventLabel =
+        state.latestLifecycleStatus.active_event_name || state.latestLifecycleStatus.active_event_id || "Active event";
+      simMeta = `${eventLabel} pre-event snapshot`;
+    }
+    ui.versionSimulationValue.textContent = simValue;
+    if (ui.versionSimulationMeta) {
+      ui.versionSimulationMeta.textContent = simMeta;
+    }
+    if (ui.versionSimulationTile) {
+      ui.versionSimulationTile.classList.add("healthy");
+    }
+  }
+
+  if (ui.versionRetrainValue) {
+    let retrainValue = "v0";
+    let retrainMeta = "Not trained.";
+    let degraded = false;
+    if (state.latestLearningStatus) {
+      const version = Number(state.latestLearningStatus.calibration_version || 0);
+      retrainValue = version > 0 ? `v${version}` : "v0";
+      const winMarket = findMarketStatus(state.latestLearningStatus, "win");
+      const before = Number(winMarket?.brier_before);
+      const after = Number(winMarket?.brier_after);
+      if (Number.isFinite(before) && Number.isFinite(after)) {
+        if (after > before + 1e-9) {
+          degraded = true;
+          retrainMeta = `Win Brier degraded ${before.toFixed(4)} -> ${after.toFixed(4)}.`;
+        } else {
+          retrainMeta = `Win Brier ${before.toFixed(4)} -> ${after.toFixed(4)}.`;
+        }
+      } else {
+        retrainMeta = `Resolved events=${Number(state.latestLearningStatus.resolved_events || 0)} | pending=${Number(state.latestLearningStatus.pending_events || 0)}`;
+      }
+    }
+    ui.versionRetrainValue.textContent = retrainValue;
+    if (ui.versionRetrainMeta) {
+      ui.versionRetrainMeta.textContent = retrainMeta;
+    }
+    if (ui.versionRetrainTile) {
+      ui.versionRetrainTile.classList.toggle("degraded", degraded);
+      ui.versionRetrainTile.classList.toggle("healthy", !degraded);
+    }
+  }
+}
+
 function renderLearningStatus(payload) {
   state.latestLearningStatus = payload;
   const winMarket = findMarketStatus(payload, "win");
-  const brierSummary =
-    winMarket && winMarket.samples > 0
-      ? `win Brier ${formatScore(winMarket.brier_before)} -> ${formatScore(winMarket.brier_after)}`
-      : "win Brier unavailable (need resolved outcomes)";
+  let brierSummary = "win Brier unavailable (need resolved outcomes)";
+  if (winMarket && winMarket.samples > 0) {
+    const before = Number(winMarket.brier_before);
+    const after = Number(winMarket.brier_after);
+    if (Number.isFinite(before) && Number.isFinite(after)) {
+      if (after > before + 1e-9) {
+        brierSummary = `win Brier degraded ${formatScore(before)} -> ${formatScore(after)} (calibration quarantined; run retrain)`;
+      } else {
+        brierSummary = `win Brier ${formatScore(before)} -> ${formatScore(after)}`;
+      }
+    }
+  }
   setLearningStatus(
     `Learning v${payload.calibration_version} | resolved events=${payload.resolved_events} | pending=${payload.pending_events} | ${brierSummary}`
   );
+  updateVersionCallouts();
+}
+
+function renderLifecycleStatus(payload) {
+  state.latestLifecycleStatus = payload;
+  const activeLabel =
+    payload.active_event_name && payload.active_event_id
+      ? `${payload.active_event_name} (${payload.active_event_id}:${payload.active_event_year || "-"})`
+      : "No active event";
+  const preEventLabel = payload.pre_event_snapshot_ready
+    ? `yes (v${payload.pre_event_snapshot_version || "-"})`
+    : "no";
+  const runNote = payload.last_run_note ? ` | ${payload.last_run_note}` : "";
+  setLifecycleStatus(
+    `Lifecycle: active=${activeLabel} | state=${payload.active_event_state || "-"} | pre-event snapshot=${preEventLabel} | pending=${payload.pending_events}${runNote}`
+  );
+  renderLifecycleHistory(payload.recent_events || []);
+  updateVersionCallouts();
+}
+
+function renderLifecycleHistory(events) {
+  if (!ui.lifecycleHistoryBody) {
+    return;
+  }
+  ui.lifecycleHistoryBody.innerHTML = "";
+  if (!Array.isArray(events) || events.length === 0) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 7;
+    td.textContent = "No lifecycle events yet.";
+    tr.appendChild(td);
+    ui.lifecycleHistoryBody.appendChild(tr);
+    return;
+  }
+  events.forEach((event) => {
+    const tr = document.createElement("tr");
+    const cells = [
+      event.event_name || event.event_id || "-",
+      event.event_year != null ? String(event.event_year) : "-",
+      formatLifecycleState(event.state),
+      event.pre_event_snapshot_version != null ? `v${event.pre_event_snapshot_version}` : "-",
+      event.retrain_version != null ? `v${event.retrain_version}` : "-",
+      event.outcomes_source || "-",
+      formatDate(event.updated_at),
+    ];
+    cells.forEach((value) => {
+      const td = document.createElement("td");
+      td.textContent = value;
+      tr.appendChild(td);
+    });
+    ui.lifecycleHistoryBody.appendChild(tr);
+  });
 }
 
 function playerRowKey(player, index) {
@@ -750,6 +915,68 @@ async function loadLearningStatus(silent = false) {
   }
 }
 
+async function loadLifecycleStatus(silent = false) {
+  if (!silent) {
+    setLifecycleStatus("Loading lifecycle status...", true);
+  }
+  try {
+    const tour = encodeURIComponent(ui.tourSelect.value);
+    const response = await fetch(`/lifecycle/status?tour=${tour}`);
+    if (!response.ok) {
+      let detail = `Unable to load lifecycle status (${response.status})`;
+      try {
+        const errPayload = await response.json();
+        if (errPayload?.detail) {
+          detail = String(errPayload.detail);
+        }
+      } catch (_) {
+        // Keep default detail message when body is not JSON.
+      }
+      throw new Error(detail);
+    }
+    const payload = await response.json();
+    renderLifecycleStatus(payload);
+  } catch (error) {
+    if (!silent) {
+      setLifecycleStatus("Unable to load lifecycle status.");
+      setError(error.message || "Unexpected error while loading lifecycle status.");
+    }
+  }
+}
+
+async function runLifecycleNow() {
+  setError();
+  setBusy(true);
+  setLifecycleStatus("Running lifecycle automation cycle...", true);
+  try {
+    const tour = encodeURIComponent(ui.tourSelect.value);
+    const response = await fetch(`/lifecycle/run?tour=${tour}`, {
+      method: "POST",
+    });
+    if (!response.ok) {
+      let detail = `Lifecycle run failed (${response.status})`;
+      try {
+        const errPayload = await response.json();
+        if (errPayload?.detail) {
+          detail = String(errPayload.detail);
+        }
+      } catch (_) {
+        // Keep default detail message when body is not JSON.
+      }
+      throw new Error(detail);
+    }
+    const payload = await response.json();
+    renderLifecycleStatus(payload);
+    setStatus("Lifecycle automation cycle completed.");
+    void loadLearningStatus(true);
+  } catch (error) {
+    setStatus("Lifecycle automation cycle failed.");
+    setError(error.message || "Unexpected error while running lifecycle automation.");
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function syncLearningAndRetrain() {
   setError();
   setBusy(true);
@@ -791,6 +1018,7 @@ async function syncLearningAndRetrain() {
       statusParts.push(payload.sync_note);
     }
     setStatus(`Learning sync complete. ${statusParts.join(" | ")}`);
+    void loadLifecycleStatus(true);
   } catch (error) {
     setStatus("Learning sync/retrain failed.");
     setError(error.message || "Unexpected error during learning retrain.");
@@ -864,6 +1092,46 @@ function stopAutoRefresh() {
     window.clearInterval(state.autoRefreshTimerId);
     state.autoRefreshTimerId = null;
   }
+}
+
+function stopAutoSimulation() {
+  if (state.autoSimulationTimerId != null) {
+    window.clearInterval(state.autoSimulationTimerId);
+    state.autoSimulationTimerId = null;
+  }
+}
+
+function stopLifecyclePoll() {
+  if (state.lifecyclePollTimerId != null) {
+    window.clearInterval(state.lifecyclePollTimerId);
+    state.lifecyclePollTimerId = null;
+  }
+}
+
+function startLifecyclePoll() {
+  stopLifecyclePoll();
+  state.lifecyclePollTimerId = window.setInterval(() => {
+    void loadLifecycleStatus(true);
+  }, 45000);
+}
+
+function startAutoSimulation() {
+  stopAutoSimulation();
+  setSimulationAutomationStatus(
+    `Simulation automation: enabled every ${AUTOMATION_SIMULATION_INTERVAL_SECONDS}s. Preparing first run...`,
+    true
+  );
+  const runOnce = () => {
+    if (state.simulationInFlight) {
+      return;
+    }
+    void runSimulation(true);
+  };
+  window.setTimeout(runOnce, 3000);
+  state.autoSimulationTimerId = window.setInterval(
+    runOnce,
+    AUTOMATION_SIMULATION_INTERVAL_SECONDS * 1000
+  );
 }
 
 function applyAutoRefreshSchedule() {
@@ -1059,6 +1327,7 @@ function renderResult(payload) {
   renderWinChart(payload.players);
   renderTable(payload.players);
   ui.resultsSection.hidden = false;
+  updateVersionCallouts();
 }
 
 async function runSimulation(fromAutoRefresh = false) {
@@ -1068,6 +1337,9 @@ async function runSimulation(fromAutoRefresh = false) {
   state.simulationInFlight = true;
   setError();
   setFormStatus("Loading seasonal form data...", true);
+  if (fromAutoRefresh) {
+    setSimulationAutomationStatus("Simulation automation: running scheduled simulation...", true);
+  }
   setBusy(true);
   setStatus(
     fromAutoRefresh ? "Running auto-refresh simulation..." : "Running simulation...",
@@ -1076,16 +1348,16 @@ async function runSimulation(fromAutoRefresh = false) {
 
   try {
     const simulations = Number.parseInt(ui.simulationsInput.value, 10) || 10000;
-    const minSimulations = Number.parseInt(ui.minSimulationsInput.value, 10) || 5000;
-    const simulationBatchSize = Number.parseInt(ui.simulationBatchSizeInput.value, 10) || 5000;
+    const minSimulations = Number.parseInt(ui.minSimulationsInput.value, 10) || 250000;
+    const simulationBatchSize = Number.parseInt(ui.simulationBatchSizeInput.value, 10) || 10000;
     const cutSize = Number.parseInt(ui.cutSizeInput.value, 10) || 70;
     const meanReversion = Number.parseFloat(ui.meanReversionInput.value) || 0.1;
     const sharedRoundShockSigma = Number.parseFloat(ui.sharedRoundShockInput.value) || 0.35;
     const useAdaptiveSimulation = ui.useAdaptiveSimulationSelect.value === "yes";
-    const ciConfidence = Number.parseFloat(ui.ciConfidenceInput.value) || 0.95;
+    const ciConfidence = Number.parseFloat(ui.ciConfidenceInput.value) || 0.975;
     const ciHalfWidthTarget =
-      Number.parseFloat(ui.ciHalfWidthTargetInput.value) || 0.0025;
-    const ciTopN = Number.parseInt(ui.ciTopNInput.value, 10) || 10;
+      Number.parseFloat(ui.ciHalfWidthTargetInput.value) || 0.0015;
+    const ciTopN = Number.parseInt(ui.ciTopNInput.value, 10) || 15;
     const useInPlayConditioning = ui.useInPlayConditioningSelect.value === "yes";
     const useSeasonalForm = ui.useSeasonalFormSelect.value === "yes";
     const baselineSeason = Number.parseInt(ui.baselineSeasonInput.value, 10);
@@ -1098,7 +1370,7 @@ async function runSimulation(fromAutoRefresh = false) {
     const requestBody = {
       tour: ui.tourSelect.value,
       event_id: ui.eventSelect.value || null,
-      resolution_mode: ui.resolutionModeSelect.value || "auto_target",
+      resolution_mode: ui.resolutionModeSelect.value || "fixed_cap",
       simulations: simulations,
       min_simulations: minSimulations,
       simulation_batch_size: simulationBatchSize,
@@ -1155,6 +1427,15 @@ async function runSimulation(fromAutoRefresh = false) {
     if (payload.stop_reason) {
       statusBits.push(`stop=${payload.stop_reason}`);
     }
+    if (payload.simulations != null) {
+      if (payload.requested_simulations && payload.requested_simulations !== payload.simulations) {
+        statusBits.push(
+          `sims=${Number(payload.simulations).toLocaleString()}/${Number(payload.requested_simulations).toLocaleString()}`
+        );
+      } else {
+        statusBits.push(`sims=${Number(payload.simulations).toLocaleString()}`);
+      }
+    }
     if (payload.win_ci_half_width_top_n != null) {
       statusBits.push(`top-N CI half-width=${(payload.win_ci_half_width_top_n * 100).toFixed(3)}%`);
     }
@@ -1168,9 +1449,21 @@ async function runSimulation(fromAutoRefresh = false) {
       statusBits.push(`snapshot=v${Number(payload.simulation_version)}`);
     }
     setStatus(statusBits.length > 0 ? `Simulation complete. ${statusBits.join(" | ")}` : "Simulation complete.");
+    if (fromAutoRefresh) {
+      setSimulationAutomationStatus(
+        `Simulation automation: last run ${new Date().toLocaleTimeString()} | next run in ${AUTOMATION_SIMULATION_INTERVAL_SECONDS}s.`
+      );
+    }
     void loadLearningStatus(true);
+    void loadLifecycleStatus(true);
   } catch (error) {
     setStatus("Simulation failed.");
+    if (fromAutoRefresh) {
+      setSimulationAutomationStatus(
+        "Simulation automation: latest scheduled run failed (see error).",
+        false
+      );
+    }
     setError(error.message || "Unexpected error while running the simulation.");
   } finally {
     setBusy(false);
@@ -1189,10 +1482,16 @@ function bindEvents() {
   if (ui.refreshLearningButton) {
     ui.refreshLearningButton.addEventListener("click", () => loadLearningStatus());
   }
+  if (ui.runLifecycleButton) {
+    ui.runLifecycleButton.addEventListener("click", runLifecycleNow);
+  }
   ui.tourSelect.addEventListener("change", () => {
     resetEventTrends();
-    void loadEvents();
+    void loadEvents().then(() => {
+      startAutoSimulation();
+    });
     void loadLearningStatus(true);
+    void loadLifecycleStatus(true);
   });
   if (ui.eventSelect) {
     ui.eventSelect.addEventListener("change", () => {
@@ -1251,7 +1550,10 @@ function init() {
   const currentYear = new Date().getFullYear();
   ui.currentSeasonInput.value = String(currentYear);
   ui.baselineSeasonInput.value = String(currentYear - 1);
-  ui.resolutionModeSelect.value = "auto_target";
+  ui.resolutionModeSelect.value = "fixed_cap";
+  if (ui.useAdaptiveSimulationSelect) {
+    ui.useAdaptiveSimulationSelect.value = "no";
+  }
   applyTableHeaderTooltips();
   applyControlTooltips();
   bindEvents();
@@ -1261,9 +1563,14 @@ function init() {
   ui.seasonalWeightValue.textContent = Number.parseFloat(ui.seasonalWeightInput.value).toFixed(2);
   ui.currentSeasonWeightValue.textContent = Number.parseFloat(ui.currentSeasonWeightInput.value).toFixed(2);
   ui.formDeltaWeightValue.textContent = Number.parseFloat(ui.formDeltaWeightInput.value).toFixed(2);
-  loadEvents();
+  updateVersionCallouts();
+  void loadEvents().then(() => {
+    startAutoSimulation();
+  });
   loadLearningStatus(true);
+  loadLifecycleStatus(true);
   applyAutoRefreshSchedule();
+  startLifecyclePoll();
 }
 
 init();

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -16,6 +18,7 @@ from .datagolf_client import DataGolfAPIError, DataGolfClient
 from .learning import LearningStore
 from .models import (
     EventSummary,
+    LifecycleStatusResponse,
     LearningEventTrendsResponse,
     LearningStatusResponse,
     LearningSyncRequest,
@@ -28,18 +31,58 @@ from .service import SimulationService
 _settings = get_settings()
 _client = DataGolfClient(_settings)
 _learning_store = LearningStore(_settings.learning_database_path)
-_service = SimulationService(_client, learning_store=_learning_store)
+_service = SimulationService(
+    _client,
+    learning_store=_learning_store,
+    lifecycle_automation_enabled=_settings.lifecycle_automation_enabled,
+    lifecycle_tour=_settings.lifecycle_tour,
+    lifecycle_pre_event_simulations=_settings.lifecycle_pre_event_simulations,
+    lifecycle_pre_event_seed=_settings.lifecycle_pre_event_seed,
+    lifecycle_sync_max_events=_settings.lifecycle_sync_max_events,
+    lifecycle_backfill_enabled=_settings.lifecycle_backfill_enabled,
+    lifecycle_backfill_batch_size=_settings.lifecycle_backfill_batch_size,
+    lifecycle_target_year=_settings.lifecycle_target_year,
+)
 _authenticator = RequestAuthenticator(_settings)
 _web_dir = Path(__file__).resolve().parent / "web"
 _assets_dir = _web_dir / "assets"
+_lifecycle_stop_event: asyncio.Event | None = None
+_lifecycle_task: asyncio.Task[None] | None = None
+
+
+async def _lifecycle_worker(stop_event: asyncio.Event) -> None:
+    interval_seconds = max(30, int(_settings.lifecycle_automation_interval_seconds))
+    lifecycle_tour = (_settings.lifecycle_tour or "pga").strip().lower()
+    while not stop_event.is_set():
+        try:
+            await _service.run_lifecycle_cycle(tour=lifecycle_tour)
+        except Exception:
+            # Keep automation resilient; status endpoint still reflects last run note.
+            pass
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+        except asyncio.TimeoutError:
+            continue
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global _lifecycle_stop_event
+    global _lifecycle_task
     _authenticator.validate_configuration()
+    if _settings.lifecycle_automation_enabled:
+        _lifecycle_stop_event = asyncio.Event()
+        _lifecycle_task = asyncio.create_task(_lifecycle_worker(_lifecycle_stop_event))
     try:
         yield
     finally:
+        if _lifecycle_stop_event is not None:
+            _lifecycle_stop_event.set()
+        if _lifecycle_task is not None:
+            with suppress(Exception):
+                await _lifecycle_task
+        _lifecycle_stop_event = None
+        _lifecycle_task = None
         await _client.aclose()
 
 
@@ -160,6 +203,31 @@ async def learning_event_trends(
             max_snapshots=max_snapshots,
             max_players=max_players,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/lifecycle/status", response_model=LifecycleStatusResponse)
+async def lifecycle_status(
+    tour: str = Query(default="pga"),
+) -> LifecycleStatusResponse:
+    try:
+        return await _service.get_lifecycle_status(tour=tour)
+    except DataGolfAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/lifecycle/run", response_model=LifecycleStatusResponse)
+async def lifecycle_run(
+    tour: Optional[str] = Query(default=None),
+    _: None = Depends(require_learning_admin),
+) -> LifecycleStatusResponse:
+    try:
+        return await _service.run_lifecycle_cycle(tour=tour)
+    except DataGolfAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

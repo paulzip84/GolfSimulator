@@ -16,25 +16,26 @@ class EventSummary(BaseModel):
 class SimulationRequest(BaseModel):
     tour: str = Field(default="pga")
     event_id: Optional[str] = Field(default=None)
-    resolution_mode: str = Field(default="auto_target")
-    simulations: int = Field(default=10_000, ge=500, le=250_000)
-    min_simulations: int = Field(default=5_000, ge=500, le=250_000)
-    simulation_batch_size: int = Field(default=5_000, ge=500, le=50_000)
+    resolution_mode: str = Field(default="fixed_cap")
+    simulations: int = Field(default=1_000_000, ge=500, le=2_000_000)
+    min_simulations: int = Field(default=250_000, ge=500, le=250_000)
+    simulation_batch_size: int = Field(default=10_000, ge=500, le=50_000)
     seed: Optional[int] = Field(default=None)
     cut_size: int = Field(default=70, ge=20, le=156)
     mean_reversion: float = Field(default=0.10, ge=0.0, le=0.4)
     shared_round_shock_sigma: float = Field(default=0.35, ge=0.0, le=2.0)
     enable_adaptive_simulation: bool = Field(default=True)
-    ci_confidence: float = Field(default=0.95, ge=0.5, le=0.999)
-    ci_half_width_target: float = Field(default=0.0025, ge=0.0001, le=0.05)
-    ci_top_n: int = Field(default=10, ge=1, le=50)
+    ci_confidence: float = Field(default=0.975, ge=0.5, le=0.999)
+    ci_half_width_target: float = Field(default=0.0015, ge=0.0001, le=0.05)
+    ci_top_n: int = Field(default=15, ge=1, le=50)
     enable_in_play_conditioning: bool = Field(default=True)
     enable_seasonal_form: bool = Field(default=True)
     baseline_season: Optional[int] = Field(default=None, ge=1990, le=2100)
     current_season: Optional[int] = Field(default=None, ge=1990, le=2100)
     seasonal_form_weight: float = Field(default=0.35, ge=0.0, le=1.0)
-    current_season_weight: float = Field(default=0.60, ge=0.0, le=1.0)
+    current_season_weight: float = Field(default=0.85, ge=0.0, le=1.0)
     form_delta_weight: float = Field(default=0.25, ge=0.0, le=1.0)
+    snapshot_type: str = Field(default="manual")
 
 
 class PlayerSimulationOutput(BaseModel):
@@ -132,6 +133,7 @@ class LearningEventSnapshot(BaseModel):
     run_id: str
     created_at: datetime
     simulation_version: int = 1
+    snapshot_type: str = "manual"
     simulations: Optional[int] = None
     in_play_applied: bool = False
 
@@ -140,6 +142,7 @@ class LearningEventTrendPoint(BaseModel):
     run_id: str
     created_at: datetime
     simulation_version: int = 1
+    snapshot_type: str = "manual"
     win_probability: float
     top_3_probability: float
     top_5_probability: float
@@ -168,3 +171,33 @@ class LearningEventTrendsResponse(BaseModel):
     latest_simulation_version: Optional[int] = None
     snapshots: list[LearningEventSnapshot] = Field(default_factory=list)
     players: list[LearningPlayerEventTrend] = Field(default_factory=list)
+
+
+class LifecycleEventStatus(BaseModel):
+    tour: str
+    event_id: str
+    event_year: int
+    event_name: Optional[str] = None
+    event_date: Optional[str] = None
+    state: str = "scheduled"
+    pre_event_snapshot_version: Optional[int] = None
+    outcomes_source: Optional[str] = None
+    retrain_version: Optional[int] = None
+    updated_at: Optional[datetime] = None
+    last_note: Optional[str] = None
+
+
+class LifecycleStatusResponse(BaseModel):
+    generated_at: datetime
+    tour: str
+    automation_enabled: bool = True
+    active_event_id: Optional[str] = None
+    active_event_name: Optional[str] = None
+    active_event_year: Optional[int] = None
+    active_event_state: Optional[str] = None
+    pre_event_snapshot_ready: bool = False
+    pre_event_snapshot_version: Optional[int] = None
+    pending_events: int = 0
+    last_run_at: Optional[datetime] = None
+    last_run_note: Optional[str] = None
+    recent_events: list[LifecycleEventStatus] = Field(default_factory=list)

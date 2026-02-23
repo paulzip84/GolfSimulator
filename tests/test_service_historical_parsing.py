@@ -2,6 +2,7 @@ from pga_sim.service import (
     _extract_player_metric_observations,
     _historical_event_descriptors,
     _parse_season_value,
+    _season_from_row,
 )
 
 
@@ -26,6 +27,16 @@ def test_historical_event_descriptors_filters_by_requested_year() -> None:
     assert ("B", 2025) in descriptors
     assert ("C", 2025) in descriptors
     assert ("D", 2025) in descriptors
+
+
+def test_season_from_row_prefers_calendar_year_over_season() -> None:
+    row = {
+        "event_id": "X",
+        "season": 2025,
+        "calendar_year": 2026,
+        "date": "2026-01-25",
+    }
+    assert _season_from_row(row) == 2026
 
 
 def test_extract_player_metric_observations_from_round_score_arrays() -> None:

@@ -420,6 +420,153 @@ def test_simulation_version_resets_by_event_year(tmp_path) -> None:
     assert trends_2026["latest_simulation_version"] == 1
 
 
+def test_learning_store_tracks_pre_event_snapshot_lifecycle(tmp_path) -> None:
+    db_path = tmp_path / "learning_lifecycle.sqlite3"
+    store = LearningStore(str(db_path))
+
+    players = [
+        {
+            "player_id": "8101",
+            "player_name": "Lifecycle A",
+            "win_probability": 0.16,
+            "top_3_probability": 0.38,
+            "top_5_probability": 0.54,
+            "top_10_probability": 0.72,
+        },
+        {
+            "player_id": "8102",
+            "player_name": "Lifecycle B",
+            "win_probability": 0.11,
+            "top_3_probability": 0.31,
+            "top_5_probability": 0.47,
+            "top_10_probability": 0.66,
+        },
+    ]
+
+    run_id, version = store.record_prediction(
+        tour="pga",
+        event_id="77",
+        event_name="Lifecycle Open",
+        event_date="2026-03-01",
+        requested_simulations=12000,
+        simulations=12000,
+        enable_in_play=True,
+        in_play_applied=False,
+        snapshot_type="pre_event",
+        players=players,
+    )
+    assert run_id
+    assert version == 1
+
+    pre_snapshot = store.get_pre_event_snapshot(
+        tour="pga",
+        event_id="77",
+        event_year=2026,
+    )
+    assert pre_snapshot is not None
+    assert int(pre_snapshot["simulation_version"]) == 1
+
+    lifecycle_rows = store.list_event_lifecycle(tour="pga", max_events=5)
+    assert len(lifecycle_rows) == 1
+    assert lifecycle_rows[0]["event_id"] == "77"
+    assert lifecycle_rows[0]["state"] == "pre_event_snapshot_taken"
+    assert lifecycle_rows[0]["pre_event_snapshot_version"] == 1
+
+
+def test_learning_store_reconciles_event_year_mismatch_from_dates(tmp_path) -> None:
+    db_path = tmp_path / "learning_year_reconcile.sqlite3"
+    store = LearningStore(str(db_path))
+
+    with store._lock, store._connect() as conn:  # type: ignore[attr-defined]
+        conn.execute(
+            """
+            INSERT INTO simulation_runs (
+              run_id, created_at, tour, event_id, event_name, event_year, event_date,
+              simulation_version, snapshot_type, enable_in_play, in_play_applied
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "run-year-fix-1",
+                "2026-01-26T00:00:00+00:00",
+                "pga",
+                "2",
+                "The American Express",
+                2025,
+                "2026-01-25",
+                1,
+                "pre_event",
+                0,
+                0,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO event_outcomes (
+              tour, event_id, event_year, event_name, event_completed,
+              player_key, player_id, player_name, finish_rank, won, top3, top5, top10
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "pga",
+                "2",
+                2025,
+                "The American Express",
+                "2026-01-25",
+                "1001",
+                "1001",
+                "Player A",
+                1,
+                1,
+                1,
+                1,
+                1,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO event_lifecycle (
+              tour, event_id, event_year, event_name, event_date, state,
+              pre_event_run_id, pre_event_simulation_version,
+              outcomes_source, retrain_version, updated_at, last_note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "pga",
+                "2",
+                2025,
+                "The American Express",
+                "2026-01-25",
+                "retrained",
+                "run-year-fix-1",
+                1,
+                "official",
+                4,
+                "2026-01-26T00:10:00+00:00",
+                "Year mismatch test",
+            ),
+        )
+        conn.commit()
+
+    # Re-open to trigger initialize reconciliation logic.
+    LearningStore(str(db_path))
+
+    with store._lock, store._connect() as conn:  # type: ignore[attr-defined]
+        run_year = conn.execute(
+            "SELECT event_year FROM simulation_runs WHERE run_id = ?",
+            ("run-year-fix-1",),
+        ).fetchone()[0]
+        outcome_year = conn.execute(
+            "SELECT event_year FROM event_outcomes WHERE tour = 'pga' AND event_id = '2'",
+        ).fetchone()[0]
+        lifecycle_year = conn.execute(
+            "SELECT event_year FROM event_lifecycle WHERE tour = 'pga' AND event_id = '2'",
+        ).fetchone()[0]
+
+    assert int(run_year) == 2026
+    assert int(outcome_year) == 2026
+    assert int(lifecycle_year) == 2026
+
+
 def test_retrain_without_observations_keeps_version_stable(tmp_path) -> None:
     db_path = tmp_path / "learning_empty.sqlite3"
     store = LearningStore(str(db_path))

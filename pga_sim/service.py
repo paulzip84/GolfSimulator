@@ -14,6 +14,8 @@ from .learning import CalibrationMetrics, LearningStore, PendingOutcomeEvent
 from .models import (
     CalibrationMarketStatus,
     EventSummary,
+    LifecycleEventStatus,
+    LifecycleStatusResponse,
     LearningEventTrendsResponse,
     LearningStatusResponse,
     LearningSyncResponse,
@@ -131,6 +133,7 @@ _HOLE_SCORE_FLAT_KEYS = tuple(
     + [f"hole{idx}" for idx in range(1, 19)]
     + [f"hole_{idx}" for idx in range(1, 19)]
 )
+_LIFECYCLE_COMPLETED_STATES = {"complete", "outcomes_synced", "awaiting_official", "retrained"}
 
 
 @dataclass
@@ -196,10 +199,36 @@ class _InPlayConditioningResult:
 
 
 class SimulationService:
-    def __init__(self, datagolf: DataGolfClient, learning_store: LearningStore | None = None):
+    def __init__(
+        self,
+        datagolf: DataGolfClient,
+        learning_store: LearningStore | None = None,
+        *,
+        lifecycle_automation_enabled: bool = True,
+        lifecycle_tour: str = "pga",
+        lifecycle_pre_event_simulations: int = 20_000,
+        lifecycle_pre_event_seed: int | None = 20260223,
+        lifecycle_sync_max_events: int = 40,
+        lifecycle_backfill_enabled: bool = True,
+        lifecycle_backfill_batch_size: int = 5,
+        lifecycle_target_year: int | None = None,
+    ):
         self._datagolf = datagolf
         self._learning = learning_store
         self._season_metrics_cache: dict[tuple[str, int], _SeasonLoadResult] = {}
+        self._lifecycle_automation_enabled = bool(lifecycle_automation_enabled)
+        self._lifecycle_tour = (lifecycle_tour or "pga").strip().lower()
+        self._lifecycle_pre_event_simulations = max(500, int(lifecycle_pre_event_simulations))
+        self._lifecycle_pre_event_seed = lifecycle_pre_event_seed
+        self._lifecycle_sync_max_events = max(1, int(lifecycle_sync_max_events))
+        self._lifecycle_backfill_enabled = bool(lifecycle_backfill_enabled)
+        self._lifecycle_backfill_batch_size = max(1, int(lifecycle_backfill_batch_size))
+        self._lifecycle_target_year = int(
+            lifecycle_target_year if lifecycle_target_year is not None else datetime.now(timezone.utc).year
+        )
+        self._lifecycle_lock: asyncio.Lock | None = None
+        self._last_lifecycle_run_at: datetime | None = None
+        self._last_lifecycle_run_note: str | None = None
 
     async def list_upcoming_events(self, tour: str = "pga", limit: int = 12) -> list[EventSummary]:
         schedule_payload = await self._datagolf.get_schedule(tour=tour)
@@ -267,8 +296,16 @@ class SimulationService:
         return events[:limit]
 
     async def simulate(self, request: SimulationRequest) -> SimulationResponse:
-        field_payload, pre_payload, decomp_payload = await asyncio.gather(
-            self._datagolf.get_field_updates(tour=request.tour, event_id=request.event_id),
+        field_payload = await self._datagolf.get_field_updates(
+            tour=request.tour,
+            event_id=request.event_id,
+        )
+
+        pre_payload: Any = {}
+        decomp_payload: Any = {}
+        data_feed_warnings: list[str] = []
+
+        aux_results = await asyncio.gather(
             self._datagolf.get_pre_tournament(
                 tour=request.tour,
                 event_id=request.event_id,
@@ -279,7 +316,29 @@ class SimulationService:
                 tour=request.tour,
                 event_id=request.event_id,
             ),
+            return_exceptions=True,
         )
+
+        pre_result, decomp_result = aux_results
+        if isinstance(pre_result, Exception):
+            if isinstance(pre_result, DataGolfAPIError):
+                data_feed_warnings.append(
+                    "pre-tournament probabilities unavailable; using decomposition/field fallback"
+                )
+            else:
+                raise pre_result
+        else:
+            pre_payload = pre_result
+
+        if isinstance(decomp_result, Exception):
+            if isinstance(decomp_result, DataGolfAPIError):
+                data_feed_warnings.append(
+                    "player decomposition feed unavailable; using pre-tournament/field fallback"
+                )
+            else:
+                raise decomp_result
+        else:
+            decomp_payload = decomp_result
         live_payload: Any = {}
         get_in_play = getattr(self._datagolf, "get_in_play", None)
         if callable(get_in_play):
@@ -311,7 +370,21 @@ class SimulationService:
         pre_rows = _extract_rows(pre_payload, ("pred", "tournament", "player"))
         decomp_rows = _extract_rows(decomp_payload, ("decomposition", "player"))
 
-        players = self._merge_player_records(field_rows, pre_rows, decomp_rows, live_rows)
+        field_only_players = self._merge_player_records(field_rows, [], [], [])
+        field_only_state = _lifecycle_state_from_players(field_only_players)
+        effective_live_rows = live_rows
+        if field_only_state == "scheduled" and live_rows:
+            effective_live_rows = []
+            data_feed_warnings.append(
+                "ignored stale in-play feed because field feed indicates event has not started"
+            )
+
+        players = self._merge_player_records(
+            field_rows,
+            pre_rows,
+            decomp_rows,
+            effective_live_rows,
+        )
         if len(players) < 8:
             raise ValueError(
                 "Unable to build enough players from DataGolf payloads. "
@@ -370,11 +443,18 @@ class SimulationService:
         else:
             form_adjustment_note = "Seasonal form adjustment disabled."
 
+        enable_in_play_for_request = bool(
+            request.enable_in_play_conditioning and field_only_state != "scheduled"
+        )
         in_play_context = self._build_in_play_conditioning_context(
             players=players,
             total_rounds=4,
-            enable=request.enable_in_play_conditioning,
+            enable=enable_in_play_for_request,
         )
+        if request.enable_in_play_conditioning and field_only_state == "scheduled":
+            in_play_context.note = (
+                "In-play conditioning skipped: field feed indicates event has not started."
+            )
 
         model_inputs = self._build_simulation_inputs(
             players=players,
@@ -396,14 +476,22 @@ class SimulationService:
         adaptive_enabled = bool(
             request.enable_adaptive_simulation and resolution_mode != "fixed_cap"
         )
+        effective_min_simulations = min(
+            int(request.simulations),
+            max(500, int(request.min_simulations)),
+        )
+        effective_batch_size = min(
+            int(request.simulations),
+            max(500, int(request.simulation_batch_size)),
+        )
         outputs = simulator.simulate(
             inputs=model_inputs,
             n_simulations=request.simulations,
             seed=request.seed,
             cut_size=request.cut_size,
             adaptive=adaptive_enabled,
-            min_simulations=request.min_simulations,
-            batch_size=request.simulation_batch_size,
+            min_simulations=effective_min_simulations,
+            batch_size=effective_batch_size,
             ci_confidence=request.ci_confidence,
             ci_half_width_target=request.ci_half_width_target,
             ci_top_n=request.ci_top_n,
@@ -433,39 +521,63 @@ class SimulationService:
         calibration_version = 0
         calibration_note = "Learning calibration not configured."
         if self._learning is not None:
+            scoped_status = self._learning.status(
+                tour=request.tour,
+                min_event_year=self._lifecycle_target_year,
+                max_event_year=self._lifecycle_target_year,
+            )
             snapshot = self._learning.get_snapshot(tour=request.tour)
             calibration_version = snapshot.version
-            if snapshot.version > 0 and snapshot.markets:
-                display_win_probability = snapshot.apply("win", raw_win_probability)
-                win_total = float(display_win_probability.sum())
-                if win_total > 1e-12:
-                    display_win_probability = display_win_probability / win_total
-                else:
-                    display_win_probability = raw_win_probability
-
-                display_top_3_probability = snapshot.apply("top_3", raw_top_3_probability)
-                display_top_5_probability = snapshot.apply("top_5", raw_top_5_probability)
-                display_top_10_probability = snapshot.apply("top_10", raw_top_10_probability)
-
-                display_top_3_probability = np.maximum(
-                    display_top_3_probability,
-                    display_win_probability,
-                )
-                display_top_5_probability = np.maximum(
-                    display_top_5_probability,
-                    display_top_3_probability,
-                )
-                display_top_10_probability = np.maximum(
-                    display_top_10_probability,
-                    display_top_5_probability,
-                )
-                display_top_3_probability = np.clip(display_top_3_probability, 0.0, 1.0)
-                display_top_5_probability = np.clip(display_top_5_probability, 0.0, 1.0)
-                display_top_10_probability = np.clip(display_top_10_probability, 0.0, 1.0)
-                calibration_applied = True
+            scoped_has_training = int(scoped_status.get("resolved_predictions") or 0) > 0
+            if not scoped_has_training:
                 calibration_note = (
-                    f"Applied learning calibration v{snapshot.version} from historical outcomes."
+                    f"Learning calibration is scoped to {self._lifecycle_target_year} events and is not trained yet."
                 )
+                calibration_version = 0
+            elif snapshot.version > 0 and snapshot.markets:
+                win_metric = snapshot.markets.get("win")
+                win_brier_worse = bool(
+                    win_metric is not None
+                    and win_metric.brier_before is not None
+                    and win_metric.brier_after is not None
+                    and float(win_metric.brier_after) > (float(win_metric.brier_before) + 1e-9)
+                )
+                if win_brier_worse:
+                    calibration_note = (
+                        f"Skipped learning calibration v{snapshot.version}: "
+                        f"win Brier worsened ({win_metric.brier_before:.4f} -> {win_metric.brier_after:.4f})."
+                    )
+                else:
+                    display_win_probability = snapshot.apply("win", raw_win_probability)
+                    win_total = float(display_win_probability.sum())
+                    if win_total > 1e-12:
+                        display_win_probability = display_win_probability / win_total
+                    else:
+                        display_win_probability = raw_win_probability
+
+                    display_top_3_probability = snapshot.apply("top_3", raw_top_3_probability)
+                    display_top_5_probability = snapshot.apply("top_5", raw_top_5_probability)
+                    display_top_10_probability = snapshot.apply("top_10", raw_top_10_probability)
+
+                    display_top_3_probability = np.maximum(
+                        display_top_3_probability,
+                        display_win_probability,
+                    )
+                    display_top_5_probability = np.maximum(
+                        display_top_5_probability,
+                        display_top_3_probability,
+                    )
+                    display_top_10_probability = np.maximum(
+                        display_top_10_probability,
+                        display_top_5_probability,
+                    )
+                    display_top_3_probability = np.clip(display_top_3_probability, 0.0, 1.0)
+                    display_top_5_probability = np.clip(display_top_5_probability, 0.0, 1.0)
+                    display_top_10_probability = np.clip(display_top_10_probability, 0.0, 1.0)
+                    calibration_applied = True
+                    calibration_note = (
+                        f"Applied learning calibration v{snapshot.version} from historical outcomes."
+                    )
             elif snapshot.version <= 0:
                 calibration_note = (
                     "Learning calibration is not trained yet. Run outcome sync + retrain."
@@ -533,6 +645,14 @@ class SimulationService:
             calibration_note=calibration_note,
             players=result_rows,
         )
+        if data_feed_warnings:
+            warning_note = "Data feed fallback: " + "; ".join(data_feed_warnings) + "."
+            if response.in_play_conditioning_note:
+                response.in_play_conditioning_note = (
+                    f"{response.in_play_conditioning_note} {warning_note}"
+                )
+            else:
+                response.in_play_conditioning_note = warning_note
         recorded_version = self._record_learning_prediction(
             request=request,
             response=response,
@@ -551,7 +671,11 @@ class SimulationService:
     async def get_learning_status(self, tour: str = "pga") -> LearningStatusResponse:
         if self._learning is None:
             return LearningStatusResponse(tour=tour.strip().lower())
-        status = self._learning.status(tour=tour)
+        status = self._learning.status(
+            tour=tour,
+            min_event_year=self._lifecycle_target_year,
+            max_event_year=self._lifecycle_target_year,
+        )
         return LearningStatusResponse(
             tour=status["tour"],
             predictions_logged=int(status["predictions_logged"]),
@@ -583,6 +707,361 @@ class SimulationService:
         )
         return LearningEventTrendsResponse(**payload)
 
+    async def get_lifecycle_status(self, tour: str = "pga") -> LifecycleStatusResponse:
+        normalized_tour = (tour or "pga").strip().lower()
+        generated_at = datetime.now(timezone.utc)
+        if self._learning is None:
+            return LifecycleStatusResponse(
+                generated_at=generated_at,
+                tour=normalized_tour,
+                automation_enabled=self._lifecycle_automation_enabled,
+                last_run_at=self._last_lifecycle_run_at,
+                last_run_note=self._last_lifecycle_run_note,
+            )
+
+        active_context = await self._get_active_event_context(normalized_tour)
+        recent_rows = self._learning.list_event_lifecycle(
+            tour=normalized_tour,
+            max_events=24,
+            min_event_year=self._lifecycle_target_year,
+            max_event_year=self._lifecycle_target_year,
+        )
+        pending_count = len(
+            self._learning.list_pending_events(
+                tour=normalized_tour,
+                max_events=200,
+                min_event_year=self._lifecycle_target_year,
+                max_event_year=self._lifecycle_target_year,
+            )
+        )
+        existing_tokens = {
+            (str(row["event_id"]), int(row["event_year"])) for row in recent_rows
+        }
+
+        # If lifecycle ingestion has not yet processed the most recent completed event(s),
+        # synthesize display rows from schedule so the table remains chronologically accurate.
+        get_schedule = getattr(self._datagolf, "get_schedule", None)
+        if callable(get_schedule):
+            schedule_payload: Any | None = None
+            try:
+                schedule_payload = await get_schedule(
+                    tour=normalized_tour,
+                    upcoming_only="no",
+                    season=self._lifecycle_target_year,
+                )
+            except TypeError:
+                try:
+                    schedule_payload = await get_schedule(tour=normalized_tour)
+                except Exception:
+                    schedule_payload = None
+            except DataGolfAPIError:
+                schedule_payload = None
+
+            if schedule_payload is not None:
+                today_text = datetime.now(timezone.utc).date().isoformat()
+                schedule_rows = _extract_rows(schedule_payload, ("schedule", "event"))
+                for row in schedule_rows:
+                    event_id = _normalized_event_id(_string_from_keys(row, _EVENT_ID_KEYS))
+                    if not event_id:
+                        continue
+                    event_date = _string_from_keys(row, _DATE_KEYS)
+                    if not event_date or event_date[:10] > today_text:
+                        continue
+                    event_year = _season_from_row(row) or _year_from_date(event_date)
+                    if event_year is None or int(event_year) != int(self._lifecycle_target_year):
+                        continue
+                    token = (event_id, int(event_year))
+                    if token in existing_tokens:
+                        continue
+                    existing_tokens.add(token)
+                    recent_rows.append(
+                        {
+                            "tour": normalized_tour,
+                            "event_id": event_id,
+                            "event_year": int(event_year),
+                            "event_name": _string_from_keys(row, _EVENT_NAME_KEYS),
+                            "event_date": event_date,
+                            "state": "complete",
+                            "pre_event_snapshot_version": None,
+                            "outcomes_source": None,
+                            "retrain_version": None,
+                            "updated_at": generated_at,
+                            "last_note": (
+                                "Observed as completed on schedule; awaiting lifecycle ingestion."
+                            ),
+                        }
+                    )
+
+        active_event_id: str | None = None
+        active_event_name: str | None = None
+        active_event_year: int | None = None
+        active_event_state: str | None = None
+        pre_event_snapshot_ready = False
+        pre_event_snapshot_version: int | None = None
+
+        if active_context is not None:
+            active_event_id = active_context["event_id"]
+            active_event_name = active_context["event_name"]
+            active_event_year = active_context["event_year"]
+            lifecycle_match = next(
+                (
+                    row
+                    for row in recent_rows
+                    if row["event_id"] == active_event_id
+                    and int(row["event_year"]) == int(active_event_year)
+                ),
+                None,
+            )
+            if lifecycle_match is not None:
+                active_event_state = lifecycle_match.get("state")
+                pre_event_snapshot_version = lifecycle_match.get("pre_event_snapshot_version")
+                pre_event_snapshot_ready = pre_event_snapshot_version is not None
+            else:
+                pre_snapshot = self._learning.get_pre_event_snapshot(
+                    tour=normalized_tour,
+                    event_id=active_event_id,
+                    event_year=active_event_year,
+                )
+                if pre_snapshot is not None:
+                    pre_event_snapshot_ready = True
+                    pre_event_snapshot_version = int(pre_snapshot["simulation_version"])
+
+        active_token: tuple[str, int] | None = None
+        if (
+            active_event_id is not None
+            and active_event_year is not None
+            and int(active_event_year) == int(self._lifecycle_target_year)
+        ):
+            active_token = (str(active_event_id), int(active_event_year))
+
+        filtered_rows: list[dict[str, Any]] = []
+        has_active_row = False
+        for row in recent_rows:
+            token = (str(row["event_id"]), int(row["event_year"]))
+            if active_token is not None and token == active_token:
+                has_active_row = True
+                filtered_rows.append(row)
+                continue
+            if str(row.get("state") or "").strip().lower() in _LIFECYCLE_COMPLETED_STATES:
+                filtered_rows.append(row)
+
+        if active_token is not None and not has_active_row:
+            filtered_rows.insert(
+                0,
+                {
+                    "tour": normalized_tour,
+                    "event_id": active_token[0],
+                    "event_year": active_token[1],
+                    "event_name": active_event_name,
+                    "event_date": active_context.get("event_date") if active_context else None,
+                    "state": active_event_state or "scheduled",
+                    "pre_event_snapshot_version": pre_event_snapshot_version,
+                    "outcomes_source": None,
+                    "retrain_version": None,
+                    "updated_at": generated_at,
+                    "last_note": "Active event observed in current lifecycle state.",
+                },
+            )
+
+        return LifecycleStatusResponse(
+            generated_at=generated_at,
+            tour=normalized_tour,
+            automation_enabled=self._lifecycle_automation_enabled,
+            active_event_id=active_event_id,
+            active_event_name=active_event_name,
+            active_event_year=active_event_year,
+            active_event_state=active_event_state,
+            pre_event_snapshot_ready=pre_event_snapshot_ready,
+            pre_event_snapshot_version=pre_event_snapshot_version,
+            pending_events=pending_count,
+            last_run_at=self._last_lifecycle_run_at,
+            last_run_note=self._last_lifecycle_run_note,
+            recent_events=[LifecycleEventStatus(**row) for row in filtered_rows[:24]],
+        )
+
+    async def run_lifecycle_cycle(self, tour: str | None = None) -> LifecycleStatusResponse:
+        normalized_tour = (tour or self._lifecycle_tour or "pga").strip().lower()
+        if self._learning is None:
+            raise ValueError("Learning store is not configured.")
+
+        if self._lifecycle_lock is None:
+            self._lifecycle_lock = asyncio.Lock()
+
+        async with self._lifecycle_lock:
+            note_parts: list[str] = []
+            active_context: dict[str, Any] | None = None
+            try:
+                active_context = await self._get_active_event_context(normalized_tour)
+            except DataGolfAPIError as exc:
+                note_parts.append(f"Active event lookup failed: {exc}")
+
+            exclude_event: tuple[str, int] | None = None
+            if active_context is not None and active_context["state"] != "complete":
+                exclude_event = (
+                    str(active_context["event_id"]),
+                    int(active_context["event_year"]),
+                )
+
+            if self._lifecycle_backfill_enabled:
+                backfill = await self._run_backfill_training_batch(
+                    tour=normalized_tour,
+                    max_events=self._lifecycle_backfill_batch_size,
+                    exclude_event=exclude_event,
+                    target_year=self._lifecycle_target_year,
+                )
+                note_parts.append(backfill["note"])
+
+            if active_context is None:
+                note_parts.append("No active event returned by DataGolf.")
+            elif int(active_context["event_year"]) != int(self._lifecycle_target_year):
+                note_parts.append(
+                    "Active event year "
+                    f"{active_context['event_year']} is outside configured scope "
+                    f"{self._lifecycle_target_year}; skipped active-event automation."
+                )
+            else:
+                active_state = active_context["state"]
+                self._learning.upsert_event_lifecycle(
+                    tour=normalized_tour,
+                    event_id=active_context["event_id"],
+                    event_year=active_context["event_year"],
+                    event_name=active_context["event_name"],
+                    event_date=active_context["event_date"],
+                    state=active_state,
+                    last_note=f"Lifecycle observed state={active_state}.",
+                )
+                note_parts.append(
+                    "Active event "
+                    f"{active_context['event_name']} ({active_context['event_id']}:{active_context['event_year']}) "
+                    f"state={active_state}."
+                )
+
+                pre_snapshot = self._learning.get_pre_event_snapshot(
+                    tour=normalized_tour,
+                    event_id=active_context["event_id"],
+                    event_year=active_context["event_year"],
+                )
+                if (
+                    active_state == "scheduled"
+                    and pre_snapshot is None
+                ):
+                    try:
+                        lifecycle_min_simulations = min(
+                            250_000,
+                            int(self._lifecycle_pre_event_simulations),
+                        )
+                        pre_request = SimulationRequest(
+                            tour=normalized_tour,
+                            event_id=active_context["event_id"],
+                            resolution_mode="fixed_cap",
+                            simulations=self._lifecycle_pre_event_simulations,
+                            min_simulations=lifecycle_min_simulations,
+                            simulation_batch_size=min(10_000, self._lifecycle_pre_event_simulations),
+                            seed=self._lifecycle_pre_event_seed,
+                            enable_adaptive_simulation=False,
+                            enable_in_play_conditioning=False,
+                            enable_seasonal_form=False,
+                            snapshot_type="pre_event",
+                        )
+                        pre_result = await self.simulate(pre_request)
+                        self._learning.upsert_event_lifecycle(
+                            tour=normalized_tour,
+                            event_id=active_context["event_id"],
+                            event_year=active_context["event_year"],
+                            event_name=active_context["event_name"],
+                            event_date=active_context["event_date"],
+                            state="pre_event_snapshot_taken",
+                            pre_event_simulation_version=pre_result.simulation_version,
+                            last_note=(
+                                "Automated pre-event snapshot captured "
+                                f"(v{pre_result.simulation_version})."
+                            ),
+                        )
+                        note_parts.append(
+                            f"Captured automated pre-event snapshot v{pre_result.simulation_version}."
+                        )
+                    except Exception as exc:  # pragma: no cover - protective in live runs
+                        note_parts.append(f"Pre-event snapshot failed: {exc}")
+                elif pre_snapshot is not None:
+                    note_parts.append(
+                        f"Pre-event snapshot already exists (v{pre_snapshot['simulation_version']})."
+                    )
+
+                if active_state == "in_play":
+                    try:
+                        lifecycle_min_simulations = min(
+                            250_000,
+                            int(self._lifecycle_pre_event_simulations),
+                        )
+                        live_request = SimulationRequest(
+                            tour=normalized_tour,
+                            event_id=active_context["event_id"],
+                            resolution_mode="fixed_cap",
+                            simulations=self._lifecycle_pre_event_simulations,
+                            min_simulations=lifecycle_min_simulations,
+                            simulation_batch_size=min(10_000, self._lifecycle_pre_event_simulations),
+                            seed=self._lifecycle_pre_event_seed,
+                            enable_adaptive_simulation=False,
+                            enable_in_play_conditioning=True,
+                            enable_seasonal_form=True,
+                            current_season_weight=0.85,
+                            snapshot_type="live",
+                        )
+                        live_result = await self.simulate(live_request)
+                        self._learning.upsert_event_lifecycle(
+                            tour=normalized_tour,
+                            event_id=active_context["event_id"],
+                            event_year=active_context["event_year"],
+                            event_name=active_context["event_name"],
+                            event_date=active_context["event_date"],
+                            state="in_play",
+                            last_note=(
+                                "Automated live snapshot captured "
+                                f"(v{live_result.simulation_version})."
+                            ),
+                        )
+                        note_parts.append(
+                            f"Captured automated live snapshot v{live_result.simulation_version}."
+                        )
+                    except Exception as exc:  # pragma: no cover - protective in live runs
+                        note_parts.append(f"Live snapshot failed: {exc}")
+
+            pending_before = self._learning.list_pending_events(
+                tour=normalized_tour,
+                max_events=self._lifecycle_sync_max_events,
+                min_event_year=self._lifecycle_target_year,
+                max_event_year=self._lifecycle_target_year,
+            )
+            lifecycle_status_before_sync = self._learning.status(
+                tour=normalized_tour,
+                min_event_year=self._lifecycle_target_year,
+                max_event_year=self._lifecycle_target_year,
+            )
+            force_retrain_for_health = self._win_market_brier_worse(
+                lifecycle_status_before_sync.get("markets", [])
+            )
+            if pending_before or force_retrain_for_health:
+                sync_payload = await self.sync_learning_and_retrain(
+                    tour=normalized_tour,
+                    max_events=self._lifecycle_sync_max_events,
+                )
+                if force_retrain_for_health and not pending_before:
+                    note_parts.append("Calibration health check triggered retrain.")
+                note_parts.append(
+                    "Sync/retrain: "
+                    f"events_processed={sync_payload.events_processed}, "
+                    f"outcomes={sync_payload.outcomes_fetched}, "
+                    f"retrain={'yes' if sync_payload.retrain_executed else 'no'}, "
+                    f"version=v{sync_payload.calibration_version}."
+                )
+            else:
+                note_parts.append("No pending events for sync/retrain.")
+
+            self._last_lifecycle_run_at = datetime.now(timezone.utc)
+            self._last_lifecycle_run_note = " ".join(note_parts).strip()
+
+        return await self.get_lifecycle_status(normalized_tour)
+
     async def sync_learning_and_retrain(
         self,
         tour: str = "pga",
@@ -591,9 +1070,32 @@ class SimulationService:
         if self._learning is None:
             raise ValueError("Learning store is not configured.")
 
-        baseline_snapshot = self._learning.get_snapshot(tour=tour)
-        baseline_status = self._learning.status(tour=tour)
-        pending_events = self._learning.list_pending_events(tour=tour, max_events=max_events)
+        baseline_status = self._learning.status(
+            tour=tour,
+            min_event_year=self._lifecycle_target_year,
+            max_event_year=self._lifecycle_target_year,
+        )
+        scoped_resolved_predictions = int(baseline_status.get("resolved_predictions") or 0)
+        scoped_calibration_version = int(baseline_status.get("calibration_version") or 0)
+        scoped_win_samples = 0
+        scoped_win_brier_worse = self._win_market_brier_worse(
+            baseline_status.get("markets", [])
+        )
+        for metric in baseline_status.get("markets", []):
+            metric_name = getattr(metric, "market", None)
+            if metric_name != "win":
+                continue
+            scoped_win_samples = int(getattr(metric, "samples", 0) or 0)
+            break
+        pending_events = self._learning.list_pending_events(
+            tour=tour,
+            max_events=max_events,
+            min_event_year=self._lifecycle_target_year,
+            max_event_year=self._lifecycle_target_year,
+        )
+        event_by_token = {
+            f"{event.event_id}:{event.event_year}": event for event in pending_events
+        }
         processed_event_ids: list[str] = []
         awaiting_outcomes_event_ids: list[str] = []
         outcomes_fetched = 0
@@ -622,10 +1124,22 @@ class SimulationService:
                     event_id=event.event_id,
                     event_year=event.event_year,
                     payload=official_payload,
+                    outcomes_source="official",
                 )
                 if official_rows > 0:
                     outcomes_fetched += 1
-                    processed_event_ids.append(f"{event.event_id}:{event.event_year}")
+                    event_token = f"{event.event_id}:{event.event_year}"
+                    processed_event_ids.append(event_token)
+                    self._learning.upsert_event_lifecycle(
+                        tour=event.tour,
+                        event_id=event.event_id,
+                        event_year=event.event_year,
+                        event_name=event.event_name,
+                        event_date=event.event_date,
+                        state="outcomes_synced",
+                        outcomes_source="official",
+                        last_note="Official historical outcome payload ingested.",
+                    )
                     continue
 
             provisional_payload = await self._build_provisional_outcome_payload(event=event)
@@ -635,6 +1149,7 @@ class SimulationService:
                     event_id=event.event_id,
                     event_year=event.event_year,
                     payload=provisional_payload,
+                    outcomes_source="provisional",
                 )
                 if provisional_rows > 0:
                     outcomes_fetched += 1
@@ -642,22 +1157,91 @@ class SimulationService:
                     event_token = f"{event.event_id}:{event.event_year}"
                     provisional_event_ids.append(event_token)
                     processed_event_ids.append(event_token)
+                    self._learning.upsert_event_lifecycle(
+                        tour=event.tour,
+                        event_id=event.event_id,
+                        event_year=event.event_year,
+                        event_name=event.event_name,
+                        event_date=event.event_date,
+                        state="awaiting_official",
+                        outcomes_source="provisional",
+                        last_note=(
+                            "Used completed leaderboard as provisional outcome while "
+                            "awaiting official historical endpoint."
+                        ),
+                    )
                     continue
 
             awaiting_outcomes_event_ids.append(event_label(event))
+            self._learning.upsert_event_lifecycle(
+                tour=event.tour,
+                event_id=event.event_id,
+                event_year=event.event_year,
+                event_name=event.event_name,
+                event_date=event.event_date,
+                state="awaiting_official",
+                last_note="Awaiting official outcome publication.",
+            )
 
         retrain_executed = False
         should_retrain = outcomes_fetched > 0 or (
-            int(baseline_snapshot.version) <= 0
-            and int(baseline_status.get("resolved_predictions") or 0) > 0
+            scoped_resolved_predictions > 0
+            and (
+                scoped_calibration_version <= 0
+                or scoped_win_samples != scoped_resolved_predictions
+                or scoped_win_brier_worse
+            )
         )
         if should_retrain:
-            self._learning.retrain(tour=tour, bump_version=True)
+            self._learning.retrain(
+                tour=tour,
+                bump_version=True,
+                min_event_year=self._lifecycle_target_year,
+                max_event_year=self._lifecycle_target_year,
+                reset_if_empty=True,
+            )
             retrain_executed = True
 
-        status = self._learning.status(tour=tour)
+        status = self._learning.status(
+            tour=tour,
+            min_event_year=self._lifecycle_target_year,
+            max_event_year=self._lifecycle_target_year,
+        )
         current_version = int(status["calibration_version"])
-        previous_version = int(baseline_snapshot.version)
+        previous_version = scoped_calibration_version
+
+        if processed_event_ids:
+            provisional_token_set = set(provisional_event_ids)
+            for token in processed_event_ids:
+                event = event_by_token.get(token)
+                if event is None:
+                    continue
+                is_provisional = token in provisional_token_set
+                target_state = (
+                    "awaiting_official"
+                    if is_provisional
+                    else ("retrained" if retrain_executed else "outcomes_synced")
+                )
+                note = (
+                    "Retrained using provisional outcome; replace when official endpoint publishes."
+                    if (is_provisional and retrain_executed)
+                    else (
+                        f"Outcomes synced and calibration retrained to v{current_version}."
+                        if retrain_executed
+                        else "Outcomes synced."
+                    )
+                )
+                self._learning.upsert_event_lifecycle(
+                    tour=event.tour,
+                    event_id=event.event_id,
+                    event_year=event.event_year,
+                    event_name=event.event_name,
+                    event_date=event.event_date,
+                    state=target_state,
+                    outcomes_source="provisional" if is_provisional else "official",
+                    retrain_version=(current_version if retrain_executed else None),
+                    last_note=note,
+                )
 
         note_parts: list[str] = []
         if outcomes_fetched > 0:
@@ -712,6 +1296,269 @@ class SimulationService:
             retrain_executed=retrain_executed,
             sync_note=note,
         )
+
+    async def _get_active_event_context(self, tour: str) -> dict[str, Any] | None:
+        field_payload = await self._datagolf.get_field_updates(tour=tour)
+        event_id = _normalized_event_id(_string_from_payload(field_payload, _EVENT_ID_KEYS))
+        if not event_id:
+            return None
+        event_name = _string_from_payload(field_payload, _EVENT_NAME_KEYS) or "Active Tour Event"
+        event_date = _string_from_payload(field_payload, _DATE_KEYS)
+        event_year = _year_from_date(event_date) or datetime.now(timezone.utc).year
+        field_rows = _extract_rows(field_payload, ("field", "player"))
+        players = self._merge_player_records(field_rows, [], [], [])
+        state = _lifecycle_state_from_players(players)
+        return {
+            "event_id": event_id,
+            "event_name": event_name,
+            "event_date": event_date,
+            "event_year": int(event_year),
+            "players": players,
+            "state": state,
+        }
+
+    async def _run_backfill_training_batch(
+        self,
+        *,
+        tour: str,
+        max_events: int,
+        exclude_event: tuple[str, int] | None = None,
+        target_year: int | None = None,
+    ) -> dict[str, Any]:
+        if self._learning is None:
+            return {
+                "processed_events": 0,
+                "outcomes_synced": 0,
+                "retrained": False,
+                "version": 0,
+                "note": "Backfill skipped: learning store is not configured.",
+            }
+
+        get_event_list = getattr(self._datagolf, "get_historical_event_list", None)
+        get_historical_event = getattr(self._datagolf, "get_historical_event", None)
+        if not callable(get_event_list) or not callable(get_historical_event):
+            return {
+                "processed_events": 0,
+                "outcomes_synced": 0,
+                "retrained": False,
+                "version": int(self._learning.get_snapshot(tour=tour).version),
+                "note": "Backfill skipped: historical endpoints are unavailable on this client.",
+            }
+
+        try:
+            event_list_payload = await get_event_list(tour=tour)
+        except DataGolfAPIError as exc:
+            return {
+                "processed_events": 0,
+                "outcomes_synced": 0,
+                "retrained": False,
+                "version": int(self._learning.get_snapshot(tour=tour).version),
+                "note": f"Backfill skipped: unable to load historical event list ({exc}).",
+            }
+
+        records = _historical_event_records_all_years(event_list_payload=event_list_payload, limit=1200)
+        if not records:
+            return {
+                "processed_events": 0,
+                "outcomes_synced": 0,
+                "retrained": False,
+                "version": int(self._learning.get_snapshot(tour=tour).version),
+                "note": "Backfill skipped: no historical events available.",
+            }
+
+        today = datetime.now(timezone.utc).date().isoformat()
+        now_year = datetime.now(timezone.utc).year
+        filtered_records: list[dict[str, Any]] = []
+        for record in records:
+            event_date = _to_str(record.get("date"))
+            event_year = int(record["year"])
+            if target_year is not None and event_year != int(target_year):
+                continue
+            if event_year > now_year:
+                continue
+            if event_date and event_date > today:
+                continue
+            token = (_normalized_event_id(_to_str(record.get("event_id"))), int(record["year"]))
+            if exclude_event is not None and token[0] == exclude_event[0] and token[1] == exclude_event[1]:
+                continue
+            filtered_records.append(record)
+
+        if not filtered_records:
+            note = "Backfill skipped: no eligible historical events after filtering."
+            if target_year is not None:
+                note = (
+                    "Backfill skipped: no eligible historical events after filtering "
+                    f"for {int(target_year)}."
+                )
+            return {
+                "processed_events": 0,
+                "outcomes_synced": 0,
+                "retrained": False,
+                "version": int(self._learning.get_snapshot(tour=tour).version),
+                "note": note,
+            }
+
+        filtered_records.sort(
+            key=lambda row: (
+                _safe_date_sort_key(_to_str(row.get("date"))),
+                int(row["year"]),
+                _to_str(row.get("event_id")) or "",
+            )
+        )
+
+        pending_tokens = {
+            (_normalized_event_id(event.event_id), int(event.event_year))
+            for event in self._learning.list_pending_events(
+                tour=tour,
+                max_events=2000,
+                min_event_year=target_year,
+                max_event_year=target_year,
+            )
+        }
+
+        processed_events = 0
+        outcomes_synced = 0
+        processed_tokens: list[tuple[str, int]] = []
+        rolling_sum: dict[str, float] = {}
+        rolling_count: dict[str, int] = {}
+        total_sum = 0.0
+        total_count = 0
+
+        for record in filtered_records:
+            event_id = _normalized_event_id(_to_str(record.get("event_id")))
+            if not event_id:
+                continue
+            event_year = int(record["year"])
+            event_name = _to_str(record.get("event_name"))
+            event_date = _to_str(record.get("date"))
+
+            try:
+                payload = await get_historical_event(
+                    tour=tour,
+                    event_id=event_id,
+                    year=event_year,
+                )
+            except DataGolfAPIError:
+                continue
+
+            event_rows = _event_stats_rows_from_payload(payload)
+            if not event_rows:
+                continue
+
+            pre_snapshot = self._learning.get_pre_event_snapshot(
+                tour=tour,
+                event_id=event_id,
+                event_year=event_year,
+            )
+            simulation_version_for_event = (
+                int(pre_snapshot["simulation_version"]) if pre_snapshot is not None else None
+            )
+
+            if pre_snapshot is None and processed_events < max_events:
+                prediction_players = _build_backfill_prediction_players(
+                    event_rows=event_rows,
+                    rolling_sum=rolling_sum,
+                    rolling_count=rolling_count,
+                    total_sum=total_sum,
+                    total_count=total_count,
+                )
+                if prediction_players:
+                    _, simulation_version_for_event = self._learning.record_prediction(
+                        tour=tour,
+                        event_id=event_id,
+                        event_name=event_name,
+                        event_date=event_date,
+                        requested_simulations=self._lifecycle_pre_event_simulations,
+                        simulations=self._lifecycle_pre_event_simulations,
+                        enable_in_play=False,
+                        in_play_applied=False,
+                        snapshot_type="pre_event",
+                        players=prediction_players,
+                    )
+                    processed_events += 1
+                    processed_tokens.append((event_id, event_year))
+
+            should_sync_outcome = (
+                pre_snapshot is None
+                and simulation_version_for_event is not None
+            ) or ((event_id, event_year) in pending_tokens)
+            if should_sync_outcome:
+                inserted = self._learning.record_outcome_payload(
+                    tour=tour,
+                    event_id=event_id,
+                    event_year=event_year,
+                    payload=payload,
+                    outcomes_source="official",
+                )
+                if inserted > 0:
+                    outcomes_synced += 1
+                    self._learning.upsert_event_lifecycle(
+                        tour=tour,
+                        event_id=event_id,
+                        event_year=event_year,
+                        event_name=event_name,
+                        event_date=event_date,
+                        state="outcomes_synced",
+                        pre_event_simulation_version=simulation_version_for_event,
+                        outcomes_source="official",
+                        last_note="Backfill ingested official outcomes after pre-event simulation.",
+                    )
+
+            # Update rolling metrics after event processing to keep predictions leakage-safe.
+            field_size = max(1, len(event_rows))
+            for row in event_rows:
+                player_key = _historical_player_key_from_outcome_row(row)
+                if not player_key:
+                    continue
+                metric = _backfill_metric_from_outcome_row(row=row, field_size=field_size)
+                rolling_sum[player_key] = float(rolling_sum.get(player_key, 0.0) + metric)
+                rolling_count[player_key] = int(rolling_count.get(player_key, 0) + 1)
+                total_sum += metric
+                total_count += 1
+
+            if processed_events >= max_events:
+                # Limit work per cycle to keep the service responsive.
+                break
+
+        retrained = False
+        current_version = int(self._learning.get_snapshot(tour=tour).version)
+        if outcomes_synced > 0:
+            previous = int(self._learning.get_snapshot(tour=tour).version)
+            updated = self._learning.retrain(
+                tour=tour,
+                bump_version=True,
+                min_event_year=target_year,
+                max_event_year=target_year,
+                reset_if_empty=True,
+            )
+            current_version = int(updated.version)
+            retrained = current_version > previous
+            if retrained and processed_tokens:
+                for event_id, event_year in processed_tokens:
+                    self._learning.upsert_event_lifecycle(
+                        tour=tour,
+                        event_id=event_id,
+                        event_year=event_year,
+                        state="retrained",
+                        retrain_version=current_version,
+                        last_note=f"Backfill retrained calibration to v{current_version}.",
+                    )
+
+        if processed_events <= 0 and outcomes_synced <= 0:
+            note = "Backfill: no new historical events needed processing."
+        else:
+            note = (
+                "Backfill: "
+                f"simulated={processed_events}, outcomes_synced={outcomes_synced}, "
+                f"retrain={'yes' if retrained else 'no'}, version=v{current_version}."
+            )
+        return {
+            "processed_events": processed_events,
+            "outcomes_synced": outcomes_synced,
+            "retrained": retrained,
+            "version": current_version,
+            "note": note,
+        }
 
     async def _build_provisional_outcome_payload(
         self,
@@ -789,6 +1636,18 @@ class SimulationService:
             )
         return out
 
+    @staticmethod
+    def _win_market_brier_worse(metrics: list[CalibrationMetrics]) -> bool:
+        for metric in metrics:
+            if getattr(metric, "market", None) != "win":
+                continue
+            brier_before = getattr(metric, "brier_before", None)
+            brier_after = getattr(metric, "brier_after", None)
+            if brier_before is None or brier_after is None:
+                return False
+            return float(brier_after) > (float(brier_before) + 1e-9)
+        return False
+
     def _record_learning_prediction(
         self,
         *,
@@ -826,6 +1685,10 @@ class SimulationService:
                 simulations=response.simulations,
                 enable_in_play=request.enable_in_play_conditioning,
                 in_play_applied=in_play_applied,
+                snapshot_type=_resolved_snapshot_type(
+                    request_snapshot_type=request.snapshot_type,
+                    in_play_applied=in_play_applied,
+                ),
                 players=player_rows,
             )
             return int(logged_version)
@@ -1703,7 +2566,8 @@ def _normalized_event_id(event_id: str | None) -> str | None:
 
 
 def _season_from_row(row: dict[str, Any]) -> int | None:
-    year_text = _string_from_keys(row, ("year", "season", "calendar_year"))
+    # Historical event-data endpoints use calendar year for event lookup.
+    year_text = _string_from_keys(row, ("calendar_year", "year", "season"))
     if year_text:
         parsed = _parse_season_value(year_text)
         if parsed is not None:
@@ -2213,6 +3077,34 @@ def _provisional_outcome_rows(
     return rows, False
 
 
+def _lifecycle_state_from_players(players: list[_PlayerRecord]) -> str:
+    if not players:
+        return "scheduled"
+    _, leaderboard_complete = _provisional_outcome_rows(players)
+    if leaderboard_complete:
+        return "complete"
+
+    for player in players:
+        _, is_complete, is_in_progress = _record_progress_state(player)
+        if is_in_progress:
+            return "in_play"
+        thru = _normalize_thru_value(player.current_thru)
+        if thru in {"F", "MC", "WD", "DQ", "CUT", "MDF"}:
+            return "in_play"
+        if player.round_scores:
+            return "in_play"
+        if player.today_score_to_par is not None:
+            return "in_play"
+    return "scheduled"
+
+
+def _resolved_snapshot_type(request_snapshot_type: Any, in_play_applied: bool) -> str:
+    text = str(request_snapshot_type or "").strip().lower()
+    if text in {"manual", "live", "pre_event"}:
+        return text
+    return "live" if in_play_applied else "manual"
+
+
 def _record_progress_state(record: _PlayerRecord, total_rounds: int = 4) -> tuple[bool, bool, bool]:
     known = False
     complete = False
@@ -2378,6 +3270,176 @@ def _historical_event_records(
         else:
             record["phase"] = float(idx / (total - 1))
     return records
+
+
+def _historical_event_records_all_years(
+    event_list_payload: Any,
+    limit: int = 1200,
+) -> list[dict[str, Any]]:
+    rows = _extract_rows(event_list_payload, ("event", "list", "historical", "schedule"))
+    if not rows:
+        rows = _collect_dict_nodes(event_list_payload)
+
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for row in rows:
+        event_id = _string_from_keys(row, _EVENT_ID_KEYS)
+        if not event_id:
+            continue
+        year = _season_from_row(row)
+        if year is None:
+            year = _year_from_date(_string_from_keys(row, _DATE_KEYS))
+        if year is None:
+            continue
+        key = (_normalized_event_id(event_id), int(year))
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append(
+            {
+                "event_id": event_id,
+                "year": int(year),
+                "date": _string_from_keys(row, _DATE_KEYS),
+                "event_name": _string_from_keys(row, _EVENT_NAME_KEYS),
+            }
+        )
+        if len(records) >= limit:
+            break
+
+    records.sort(
+        key=lambda record: (
+            _safe_date_sort_key(_to_str(record.get("date"))),
+            int(record["year"]),
+            _to_str(record.get("event_id")) or "",
+        )
+    )
+    return records
+
+
+def _event_stats_rows_from_payload(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        stats = payload.get("event_stats")
+        if isinstance(stats, list):
+            return [row for row in stats if isinstance(row, dict)]
+    rows: list[dict[str, Any]] = []
+    for node in _collect_dict_nodes(payload):
+        if _string_from_keys(node, ("player_name", "name", "player")):
+            rows.append(node)
+    return rows
+
+
+def _historical_player_key_from_outcome_row(row: dict[str, Any]) -> str | None:
+    player_id = _string_from_keys(row, ("dg_id", "player_id", "id", "player"))
+    player_name = _string_from_keys(row, ("player_name", "name", "player"))
+    if player_id:
+        return _normalized_player_key(player_id)
+    if player_name:
+        return _normalized_name(player_name)
+    return None
+
+
+def _backfill_metric_from_outcome_row(row: dict[str, Any], field_size: int) -> float:
+    dg_points = _numeric_from_keys(row, ("dg_points",))
+    if dg_points is not None:
+        return float(dg_points)
+
+    finish_rank = _historical_finish_rank_from_row(row)
+    if finish_rank is not None and finish_rank > 0:
+        score = ((field_size - finish_rank + 1) / max(1, field_size)) * 10.0
+        return float(score)
+    return 0.0
+
+
+def _build_backfill_prediction_players(
+    *,
+    event_rows: list[dict[str, Any]],
+    rolling_sum: dict[str, float],
+    rolling_count: dict[str, int],
+    total_sum: float,
+    total_count: int,
+) -> list[dict[str, Any]]:
+    players: list[dict[str, Any]] = []
+    skills: list[float] = []
+    global_mean = (total_sum / total_count) if total_count > 0 else 0.0
+
+    for row in event_rows:
+        player_key = _historical_player_key_from_outcome_row(row)
+        player_id = _string_from_keys(row, ("dg_id", "player_id", "id", "player"))
+        player_name = _string_from_keys(row, ("player_name", "name", "player"))
+        if not player_key or not player_name:
+            continue
+        count = int(rolling_count.get(player_key, 0))
+        if count > 0:
+            skill = float(rolling_sum.get(player_key, 0.0) / count)
+        else:
+            skill = float(global_mean)
+        players.append(
+            {
+                "player_id": str(player_id or player_key),
+                "player_name": player_name,
+            }
+        )
+        skills.append(skill)
+
+    if not players:
+        return []
+
+    skill_values = np.asarray(skills, dtype=np.float64)
+    centered = skill_values - float(np.mean(skill_values))
+    denom = float(np.std(centered))
+    if denom < 1e-6:
+        normalized = np.zeros_like(centered)
+    else:
+        normalized = centered / denom
+
+    win = _softmax_vector(1.15 * normalized)
+    top_3 = np.clip((win * 3.2) + 0.015, win, 0.98)
+    top_5 = np.clip((win * 4.9) + 0.025, top_3, 0.995)
+    top_10 = np.clip((win * 7.5) + 0.045, top_5, 0.999)
+
+    output_rows: list[dict[str, Any]] = []
+    for idx, player in enumerate(players):
+        output_rows.append(
+            {
+                "player_id": player["player_id"],
+                "player_name": player["player_name"],
+                "win_probability": float(win[idx]),
+                "top_3_probability": float(top_3[idx]),
+                "top_5_probability": float(top_5[idx]),
+                "top_10_probability": float(top_10[idx]),
+            }
+        )
+    return output_rows
+
+
+def _softmax_vector(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return arr
+    shifted = arr - float(np.max(arr))
+    exp_values = np.exp(np.clip(shifted, -30.0, 30.0))
+    total = float(np.sum(exp_values))
+    if total <= 1e-12:
+        return np.full_like(arr, 1.0 / arr.size, dtype=np.float64)
+    return exp_values / total
+
+
+def _historical_finish_rank_from_row(row: dict[str, Any]) -> int | None:
+    fin_text = _string_from_keys(row, ("fin_text", "finish", "position", "pos"))
+    if fin_text:
+        cleaned = fin_text.strip().upper()
+        if cleaned.startswith("T"):
+            cleaned = cleaned[1:]
+        if cleaned.isdigit():
+            rank = int(cleaned)
+            return rank if rank > 0 else None
+    numeric = _numeric_from_keys(row, ("finish", "position", "pos", "rank", "result"))
+    if numeric is None:
+        return None
+    if numeric < 0:
+        return None
+    rounded = int(round(numeric))
+    return rounded if rounded > 0 else None
 
 
 def _normalized_player_key(player_key: str | None) -> str | None:
@@ -2652,6 +3714,20 @@ def _finish_text_to_rank(fin_text: str) -> int | None:
         normalized = normalized[1:]
     if normalized.isdigit():
         return int(normalized)
+    return None
+
+
+def _year_from_date(value: str | None) -> int | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if len(text) >= 4 and text[:4].isdigit():
+        year = int(text[:4])
+        if 1900 <= year <= 2100:
+            return year
+    match = re.search(r"(19\d{2}|20\d{2}|21\d{2})", text)
+    if match:
+        return int(match.group(1))
     return None
 
 
