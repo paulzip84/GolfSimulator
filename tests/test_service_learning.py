@@ -321,7 +321,7 @@ def test_service_simulation_falls_back_when_pre_tournament_feed_errors(tmp_path)
     assert "Data feed fallback:" in result.in_play_conditioning_note
 
 
-def test_service_loads_latest_snapshot_from_db(tmp_path) -> None:
+def test_service_latest_snapshot_requires_refresh_when_fields_missing(tmp_path) -> None:
     learning_store = LearningStore(str(tmp_path / "service_learning_latest_snapshot.sqlite3"))
     service = SimulationService(
         _LearningClient(),
@@ -342,16 +342,17 @@ def test_service_loads_latest_snapshot_from_db(tmp_path) -> None:
     )
     assert simulated.event_id == "14"
 
-    loaded = asyncio.run(
-        service.get_latest_snapshot(
-            tour="pga",
-            event_id="14",
+    try:
+        asyncio.run(
+            service.get_latest_snapshot(
+                tour="pga",
+                event_id="14",
+            )
         )
-    )
-    assert loaded.event_id == "14"
-    assert loaded.simulation_version == simulated.simulation_version
-    assert loaded.stop_reason == "snapshot_loaded_from_db"
-    assert len(loaded.players) >= 8
+    except LookupError as exc:
+        assert "incomplete for table hydration" in str(exc).lower()
+    else:
+        raise AssertionError("Expected latest snapshot hydration to require refresh.")
 
 
 def test_service_simulation_falls_back_when_field_feed_errors(tmp_path) -> None:

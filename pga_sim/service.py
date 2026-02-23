@@ -205,7 +205,7 @@ class SimulationService:
         learning_store: LearningStore | None = None,
         *,
         simulation_max_sync_simulations: int = 2_000_000,
-        simulation_max_batch_size: int = 2_000,
+        simulation_max_batch_size: int = 1_000,
         lifecycle_automation_enabled: bool = True,
         lifecycle_tour: str = "pga",
         lifecycle_pre_event_simulations: int = 20_000,
@@ -944,6 +944,14 @@ class SimulationService:
         note_parts = ["Loaded latest persisted snapshot from DB."]
         if live_records_by_key:
             note_parts.append("Live leaderboard enrichment applied from current field feed.")
+
+        missing_fields = _snapshot_missing_table_fields(result_rows)
+        if missing_fields:
+            preview = ", ".join(missing_fields[:4])
+            raise LookupError(
+                "Stored snapshot is incomplete for table hydration "
+                f"(missing: {preview})."
+            )
 
         return SimulationResponse(
             generated_at=generated_at,
@@ -3382,6 +3390,32 @@ def _snapshot_player_lookup_key(player_id: Any, player_name: Any) -> str:
     if normalized_name:
         return f"name::{normalized_name}"
     return ""
+
+
+def _snapshot_missing_table_fields(rows: list[PlayerSimulationOutput]) -> list[str]:
+    if len(rows) < 8:
+        return ["players"]
+
+    required_fields = (
+        "baseline_win_probability",
+        "baseline_top_3_probability",
+        "baseline_top_5_probability",
+        "baseline_top_10_probability",
+        "baseline_season_metric",
+        "current_season_metric",
+        "form_delta_metric",
+        "mean_finish",
+    )
+    missing: set[str] = set()
+    for row in rows:
+        for field_name in required_fields:
+            value = getattr(row, field_name, None)
+            if value is None:
+                missing.add(field_name)
+                continue
+            if isinstance(value, (float, int)) and not np.isfinite(float(value)):
+                missing.add(field_name)
+    return sorted(missing)
 
 
 def _record_progress_state(record: _PlayerRecord, total_rounds: int = 4) -> tuple[bool, bool, bool]:

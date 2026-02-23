@@ -1,3 +1,4 @@
+from pga_sim.models import PlayerSimulationOutput
 from pga_sim.service import (
     SimulationService,
     _derive_total_to_par_from_round_data,
@@ -6,6 +7,7 @@ from pga_sim.service import (
     _provisional_outcome_rows,
     _probability_from_keys,
     _score_to_par_from_value,
+    _snapshot_missing_table_fields,
 )
 
 
@@ -281,3 +283,46 @@ def test_memory_safe_batch_cap_scales_down_for_larger_fields() -> None:
     large_field_cap = service._memory_safe_batch_cap(player_count=156)
     assert large_field_cap < small_field_cap
     assert large_field_cap >= 500
+
+
+def test_snapshot_missing_table_fields_detects_incomplete_rows() -> None:
+    rows = [
+        PlayerSimulationOutput(
+            player_id=f"{idx}",
+            player_name=f"Player {idx}",
+            win_probability=0.01 * idx,
+            top_3_probability=0.02 * idx,
+            top_5_probability=0.03 * idx,
+            top_10_probability=0.04 * idx,
+            mean_finish=float(idx),
+            mean_total_relative_to_field=0.0,
+        )
+        for idx in range(1, 9)
+    ]
+    missing = _snapshot_missing_table_fields(rows)
+    assert "baseline_win_probability" in missing
+    assert "form_delta_metric" in missing
+
+
+def test_snapshot_missing_table_fields_passes_full_rows() -> None:
+    rows = [
+        PlayerSimulationOutput(
+            player_id=f"{idx}",
+            player_name=f"Player {idx}",
+            win_probability=0.01 * idx,
+            top_3_probability=0.02 * idx,
+            top_5_probability=0.03 * idx,
+            top_10_probability=0.04 * idx,
+            mean_finish=float(idx),
+            mean_total_relative_to_field=0.0,
+            baseline_win_probability=0.01 * idx,
+            baseline_top_3_probability=0.02 * idx,
+            baseline_top_5_probability=0.03 * idx,
+            baseline_top_10_probability=0.04 * idx,
+            baseline_season_metric=0.1,
+            current_season_metric=0.2,
+            form_delta_metric=0.1,
+        )
+        for idx in range(1, 9)
+    ]
+    assert _snapshot_missing_table_fields(rows) == []

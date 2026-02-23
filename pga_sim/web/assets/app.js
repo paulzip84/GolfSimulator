@@ -13,6 +13,58 @@ const state = {
 };
 const AUTOMATION_SIMULATION_INTERVAL_SECONDS = 120;
 
+function isFiniteNumber(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric);
+}
+
+function snapshotHydrationNeedsFreshSimulation(payload) {
+  const players = Array.isArray(payload?.players) ? payload.players : [];
+  if (players.length < 8) {
+    return {
+      needsRefresh: true,
+      reason: "Stored snapshot has too few players.",
+    };
+  }
+
+  const requiredFields = [
+    "baseline_win_probability",
+    "baseline_top_3_probability",
+    "baseline_top_5_probability",
+    "baseline_top_10_probability",
+    "baseline_season_metric",
+    "current_season_metric",
+    "form_delta_metric",
+  ];
+  const missingByField = {};
+  requiredFields.forEach((field) => {
+    missingByField[field] = 0;
+  });
+
+  players.forEach((player) => {
+    requiredFields.forEach((field) => {
+      if (!isFiniteNumber(player[field])) {
+        missingByField[field] += 1;
+      }
+    });
+  });
+
+  const totalPlayers = players.length;
+  const incompleteFields = requiredFields.filter((field) => missingByField[field] > 0);
+  if (incompleteFields.length === 0) {
+    return { needsRefresh: false, reason: "" };
+  }
+
+  const preview = incompleteFields
+    .slice(0, 3)
+    .map((field) => `${field} (${missingByField[field]}/${totalPlayers})`)
+    .join(", ");
+  return {
+    needsRefresh: true,
+    reason: `Stored snapshot has missing fields: ${preview}.`,
+  };
+}
+
 function lifecycleState() {
   return String(state.latestLifecycleStatus?.active_event_state || "").trim().toLowerCase();
 }
@@ -1116,16 +1168,25 @@ async function loadLatestSnapshotFromDb({ silent = true, runIfMissing = true } =
   try {
     const response = await fetch(`/learning/latest-snapshot?${query.toString()}`);
     if (response.status === 404) {
+      let detail = "No stored snapshot found for selected event.";
+      try {
+        const errPayload = await response.json();
+        if (errPayload?.detail) {
+          detail = String(errPayload.detail);
+        }
+      } catch (_) {
+        // Keep default detail message when body is not JSON.
+      }
       if (runIfMissing && !state.simulationInFlight) {
         setStatus(
-          "No stored snapshot found for selected event. Running initial simulation...",
+          `${detail} Running initial simulation...`,
           true
         );
         await runSimulation(false);
         return;
       }
       if (!silent) {
-        setStatus("No stored snapshot found for the selected event.");
+        setStatus(detail);
       }
       return;
     }
@@ -1143,6 +1204,12 @@ async function loadLatestSnapshotFromDb({ silent = true, runIfMissing = true } =
     }
 
     const payload = await response.json();
+    const hydrationCheck = snapshotHydrationNeedsFreshSimulation(payload);
+    if (hydrationCheck.needsRefresh && runIfMissing && !state.simulationInFlight) {
+      setStatus(`${hydrationCheck.reason} Running refresh simulation...`, true);
+      await runSimulation(false);
+      return;
+    }
     renderResult(payload);
     await loadEventTrendsForCurrentEvent({ silent: true });
     setStatus(
@@ -1424,7 +1491,7 @@ async function runSimulation(fromAutoRefresh = false) {
   try {
     const simulations = Number.parseInt(ui.simulationsInput.value, 10) || 10000;
     const minSimulations = Number.parseInt(ui.minSimulationsInput.value, 10) || 250000;
-    const simulationBatchSize = Number.parseInt(ui.simulationBatchSizeInput.value, 10) || 2000;
+    const simulationBatchSize = Number.parseInt(ui.simulationBatchSizeInput.value, 10) || 1000;
     const cutSize = Number.parseInt(ui.cutSizeInput.value, 10) || 70;
     const meanReversion = Number.parseFloat(ui.meanReversionInput.value) || 0.1;
     const sharedRoundShockSigma = Number.parseFloat(ui.sharedRoundShockInput.value) || 0.35;
