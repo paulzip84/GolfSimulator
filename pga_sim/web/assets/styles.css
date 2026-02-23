@@ -475,6 +475,30 @@ td.delta-flat {
   font-family: "IBM Plex Mono", monospace;
 }
 
+.feedback-row {
+  margin-top: 2px;
+  text-align: center;
+}
+
+.feedback-link {
+  display: inline-block;
+  padding: 10px 14px;
+  border: 1px dashed #beac8f;
+  border-radius: 999px;
+  background: #fff9ef;
+  color: #5a4023;
+  text-decoration: none;
+  font-size: 0.88rem;
+  font-weight: 600;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.feedback-link:hover {
+  background: #fff2db;
+  border-color: #c68d49;
+  color: #3d2911;
+}
+
 @keyframes rise {
   from {
     opacity: 0;
