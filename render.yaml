@@ -22,6 +22,8 @@ services:
         value: "20"
       - key: DEFAULT_SIMULATIONS
         value: "10000"
+      - key: SIMULATION_MAX_SYNC_SIMULATIONS
+        value: "250000"
       - key: SIMULATION_MAX_BATCH_SIZE
         value: "2000"
       - key: LEARNING_DATABASE_PATH

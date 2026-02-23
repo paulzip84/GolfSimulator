@@ -345,6 +345,32 @@ def test_service_simulation_falls_back_when_field_feed_errors(tmp_path) -> None:
     assert "field updates unavailable" in result.in_play_conditioning_note.lower()
 
 
+def test_service_simulation_applies_sync_runtime_cap(tmp_path) -> None:
+    learning_store = LearningStore(str(tmp_path / "service_learning_sync_cap.sqlite3"))
+    service = SimulationService(
+        _LearningClient(),
+        learning_store=learning_store,
+        simulation_max_sync_simulations=2500,
+        lifecycle_target_year=2025,
+    )
+
+    result = asyncio.run(
+        service.simulate(
+            SimulationRequest(
+                tour="pga",
+                simulations=4000,
+                seed=16,
+                enable_in_play_conditioning=False,
+                enable_seasonal_form=False,
+            )
+        )
+    )
+    assert result.requested_simulations == 4000
+    assert result.simulations == 2500
+    assert result.in_play_conditioning_note is not None
+    assert "capped simulations from 4000 to 2500" in result.in_play_conditioning_note.lower()
+
+
 def test_service_ignores_stale_live_feed_when_event_is_scheduled(tmp_path) -> None:
     learning_store = LearningStore(str(tmp_path / "service_learning_stale_live.sqlite3"))
     service = SimulationService(

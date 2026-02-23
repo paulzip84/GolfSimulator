@@ -204,6 +204,7 @@ class SimulationService:
         datagolf: DataGolfClient,
         learning_store: LearningStore | None = None,
         *,
+        simulation_max_sync_simulations: int = 2_000_000,
         simulation_max_batch_size: int = 2_000,
         lifecycle_automation_enabled: bool = True,
         lifecycle_tour: str = "pga",
@@ -217,6 +218,7 @@ class SimulationService:
         self._datagolf = datagolf
         self._learning = learning_store
         self._season_metrics_cache: dict[tuple[str, int], _SeasonLoadResult] = {}
+        self._simulation_max_sync_simulations = max(500, int(simulation_max_sync_simulations))
         self._simulation_max_batch_size = max(500, int(simulation_max_batch_size))
         self._lifecycle_automation_enabled = bool(lifecycle_automation_enabled)
         self._lifecycle_tour = (lifecycle_tour or "pga").strip().lower()
@@ -427,6 +429,14 @@ class SimulationService:
                 "Verify tour/event_id and API access."
             )
 
+        effective_simulation_count = int(request.simulations)
+        if effective_simulation_count > self._simulation_max_sync_simulations:
+            data_feed_warnings.append(
+                "hosted runtime guard capped simulations "
+                f"from {effective_simulation_count} to {self._simulation_max_sync_simulations}"
+            )
+            effective_simulation_count = self._simulation_max_sync_simulations
+
         baseline_season, current_season = self._resolve_season_window(request)
         form_adjustment_applied = False
         form_adjustment_note: str | None = None
@@ -513,17 +523,17 @@ class SimulationService:
             request.enable_adaptive_simulation and resolution_mode != "fixed_cap"
         )
         effective_min_simulations = min(
-            int(request.simulations),
+            int(effective_simulation_count),
             max(500, int(request.min_simulations)),
         )
         effective_batch_size = self._effective_simulation_batch_size(
             requested_batch_size=int(request.simulation_batch_size),
-            simulation_count=int(request.simulations),
+            simulation_count=int(effective_simulation_count),
             player_count=len(players),
         )
         outputs = simulator.simulate(
             inputs=model_inputs,
-            n_simulations=request.simulations,
+            n_simulations=effective_simulation_count,
             seed=request.seed,
             cut_size=request.cut_size,
             adaptive=adaptive_enabled,

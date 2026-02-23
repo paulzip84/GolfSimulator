@@ -241,6 +241,7 @@ Deploying for friends is easiest with:
      - `LIFECYCLE_AUTOMATION_INTERVAL_SECONDS=600`
      - `LIFECYCLE_TOUR=pga`
      - `LIFECYCLE_PRE_EVENT_SIMULATIONS=1000000`
+     - `SIMULATION_MAX_SYNC_SIMULATIONS=250000` (recommended for Render to avoid gateway timeouts)
      - `SIMULATION_MAX_BATCH_SIZE=2000` (recommended for Render Starter 512MB)
      - `LIFECYCLE_PRE_EVENT_SEED=20260223`
      - `LIFECYCLE_SYNC_MAX_EVENTS=40`

@@ -1415,7 +1415,14 @@ async function runSimulation(fromAutoRefresh = false) {
           detail = String(errPayload.detail);
         }
       } catch (_) {
-        // Keep default detail message when body is not JSON.
+        try {
+          const bodyText = (await response.text()).trim();
+          if (bodyText.length > 0) {
+            detail = `${detail}: ${bodyText.slice(0, 220)}`;
+          }
+        } catch (__unused) {
+          // Keep default detail message when body is not text-readable.
+        }
       }
       throw new Error(detail);
     }

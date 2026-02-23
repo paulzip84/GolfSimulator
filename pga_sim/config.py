@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     datagolf_base_url: str = "https://feeds.datagolf.com"
     http_timeout_seconds: float = 20.0
     default_simulations: int = 1_000_000
+    simulation_max_sync_simulations: int = 2_000_000
     simulation_max_batch_size: int = 2_000
     learning_database_path: str = ".pga_sim_learning.sqlite3"
     app_auth_mode: str = "none"
