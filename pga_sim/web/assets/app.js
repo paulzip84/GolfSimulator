@@ -13,6 +13,22 @@ const state = {
 };
 const AUTOMATION_SIMULATION_INTERVAL_SECONDS = 120;
 
+function lifecycleState() {
+  return String(state.latestLifecycleStatus?.active_event_state || "").trim().toLowerCase();
+}
+
+function shouldAutoRunSimulationNow() {
+  return lifecycleState() === "in_play";
+}
+
+function autoSimulationPausedMessage() {
+  const currentState = lifecycleState();
+  if (!currentState) {
+    return "Simulation automation: waiting for lifecycle status before running.";
+  }
+  return `Simulation automation: paused until event is in-play (state=${currentState}).`;
+}
+
 const TABLE_TOOLTIPS = {
   rank: {
     layman: "Where this player ranks overall in this simulation run.",
@@ -109,9 +125,9 @@ const CONTROL_TOOLTIPS = {
   simulationsInput:
     "Maximum simulations to run (hard cap). In Auto Target mode this is a safety cap.",
   liveAutoRefreshSelect:
-    "When enabled, reruns the simulation automatically on a fixed interval to track live probability movement.",
+    "When enabled, reruns the simulation automatically on a fixed interval to track live probability movement (in-play only).",
   liveRefreshSecondsInput:
-    "Seconds between automatic simulation refreshes when Live Auto-Refresh is enabled.",
+    "Seconds between automatic simulation refreshes when Live Auto-Refresh is enabled (in-play only).",
   resolutionModeSelect:
     "Auto Target: stop when CI precision target is met; Fixed Cap: always run exactly Simulations (default for maximum resolution).",
   minSimulationsInput:
@@ -562,6 +578,9 @@ function renderLifecycleStatus(payload) {
   setLifecycleStatus(
     `Lifecycle: active=${activeLabel} | state=${payload.active_event_state || "-"} | pre-event snapshot=${preEventLabel} | pending=${payload.pending_events}${runNote}`
   );
+  if (state.autoSimulationTimerId != null && !state.simulationInFlight && !shouldAutoRunSimulationNow()) {
+    setSimulationAutomationStatus(autoSimulationPausedMessage(), false);
+  }
   renderLifecycleHistory(payload.recent_events || []);
   updateVersionCallouts();
 }
@@ -1118,11 +1137,15 @@ function startLifecyclePoll() {
 function startAutoSimulation() {
   stopAutoSimulation();
   setSimulationAutomationStatus(
-    `Simulation automation: enabled every ${AUTOMATION_SIMULATION_INTERVAL_SECONDS}s. Preparing first run...`,
-    true
+    `Simulation automation: enabled every ${AUTOMATION_SIMULATION_INTERVAL_SECONDS}s (in-play only).`,
+    false
   );
   const runOnce = () => {
     if (state.simulationInFlight) {
+      return;
+    }
+    if (!shouldAutoRunSimulationNow()) {
+      setSimulationAutomationStatus(autoSimulationPausedMessage(), false);
       return;
     }
     void runSimulation(true);
@@ -1147,9 +1170,12 @@ function applyAutoRefreshSchedule() {
     if (state.simulationInFlight) {
       return;
     }
+    if (!shouldAutoRunSimulationNow()) {
+      return;
+    }
     void runSimulation(true);
   }, seconds * 1000);
-  setStatus(`Live auto-refresh enabled every ${seconds}s.`);
+  setStatus(`Live auto-refresh enabled every ${seconds}s (runs in-play only).`);
 }
 
 function renderWinChart(players) {
