@@ -257,6 +257,139 @@ class SimulationService:
         dynamic_cap = self._memory_safe_batch_cap(player_count=player_count)
         return max(500, min(capped_by_request, static_cap, dynamic_cap))
 
+    def _apply_learning_calibration(
+        self,
+        *,
+        tour: str,
+        raw_win_probability: np.ndarray,
+        raw_top_3_probability: np.ndarray,
+        raw_top_5_probability: np.ndarray,
+        raw_top_10_probability: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool, int, str]:
+        display_win_probability = raw_win_probability.astype(np.float64, copy=True)
+        display_top_3_probability = raw_top_3_probability.astype(np.float64, copy=True)
+        display_top_5_probability = raw_top_5_probability.astype(np.float64, copy=True)
+        display_top_10_probability = raw_top_10_probability.astype(np.float64, copy=True)
+
+        calibration_applied = False
+        calibration_version = 0
+        calibration_note = "Learning calibration not configured."
+        if self._learning is None:
+            return (
+                display_win_probability,
+                display_top_3_probability,
+                display_top_5_probability,
+                display_top_10_probability,
+                calibration_applied,
+                calibration_version,
+                calibration_note,
+            )
+
+        scoped_status = self._learning.status(
+            tour=tour,
+            min_event_year=self._lifecycle_target_year,
+            max_event_year=self._lifecycle_target_year,
+        )
+        snapshot = self._learning.get_snapshot(tour=tour)
+        calibration_version = snapshot.version
+        scoped_has_training = int(scoped_status.get("resolved_predictions") or 0) > 0
+        if not scoped_has_training:
+            calibration_note = (
+                f"Learning calibration is scoped to {self._lifecycle_target_year} events and is not trained yet."
+            )
+            calibration_version = 0
+            return (
+                display_win_probability,
+                display_top_3_probability,
+                display_top_5_probability,
+                display_top_10_probability,
+                calibration_applied,
+                calibration_version,
+                calibration_note,
+            )
+
+        if snapshot.version > 0 and snapshot.markets:
+            win_metric = snapshot.markets.get("win")
+            win_brier_worse = bool(
+                win_metric is not None
+                and win_metric.brier_before is not None
+                and win_metric.brier_after is not None
+                and float(win_metric.brier_after) > (float(win_metric.brier_before) + 1e-9)
+            )
+            if win_brier_worse:
+                calibration_note = (
+                    f"Skipped learning calibration v{snapshot.version}: "
+                    f"win Brier worsened ({win_metric.brier_before:.4f} -> {win_metric.brier_after:.4f})."
+                )
+                return (
+                    display_win_probability,
+                    display_top_3_probability,
+                    display_top_5_probability,
+                    display_top_10_probability,
+                    calibration_applied,
+                    calibration_version,
+                    calibration_note,
+                )
+
+            display_win_probability = snapshot.apply("win", raw_win_probability)
+            win_total = float(display_win_probability.sum())
+            if win_total > 1e-12:
+                display_win_probability = display_win_probability / win_total
+            else:
+                display_win_probability = raw_win_probability
+
+            display_top_3_probability = snapshot.apply("top_3", raw_top_3_probability)
+            display_top_5_probability = snapshot.apply("top_5", raw_top_5_probability)
+            display_top_10_probability = snapshot.apply("top_10", raw_top_10_probability)
+
+            display_top_3_probability = np.maximum(
+                display_top_3_probability,
+                display_win_probability,
+            )
+            display_top_5_probability = np.maximum(
+                display_top_5_probability,
+                display_top_3_probability,
+            )
+            display_top_10_probability = np.maximum(
+                display_top_10_probability,
+                display_top_5_probability,
+            )
+            display_top_3_probability = np.clip(display_top_3_probability, 0.0, 1.0)
+            display_top_5_probability = np.clip(display_top_5_probability, 0.0, 1.0)
+            display_top_10_probability = np.clip(display_top_10_probability, 0.0, 1.0)
+            calibration_applied = True
+            calibration_note = (
+                f"Applied learning calibration v{snapshot.version} from historical outcomes."
+            )
+            return (
+                display_win_probability,
+                display_top_3_probability,
+                display_top_5_probability,
+                display_top_10_probability,
+                calibration_applied,
+                calibration_version,
+                calibration_note,
+            )
+
+        if snapshot.version <= 0:
+            calibration_note = (
+                "Learning calibration is not trained yet. Run outcome sync + retrain."
+            )
+        else:
+            calibration_note = (
+                "Learning calibration loaded, but no per-market parameters were available."
+            )
+
+        return (
+            display_win_probability,
+            display_top_3_probability,
+            display_top_5_probability,
+            display_top_10_probability,
+            calibration_applied,
+            calibration_version,
+            calibration_note,
+        )
+
     async def list_upcoming_events(self, tour: str = "pga", limit: int = 12) -> list[EventSummary]:
         schedule_payload = await self._datagolf.get_schedule(tour=tour)
         rows = _extract_rows(schedule_payload, ("schedule", "event"))
@@ -559,80 +692,21 @@ class SimulationService:
         raw_top_5_probability = outputs.top_5_probability.astype(np.float64, copy=True)
         raw_top_10_probability = outputs.top_10_probability.astype(np.float64, copy=True)
 
-        display_win_probability = raw_win_probability
-        display_top_3_probability = raw_top_3_probability
-        display_top_5_probability = raw_top_5_probability
-        display_top_10_probability = raw_top_10_probability
-
-        calibration_applied = False
-        calibration_version = 0
-        calibration_note = "Learning calibration not configured."
-        if self._learning is not None:
-            scoped_status = self._learning.status(
-                tour=request.tour,
-                min_event_year=self._lifecycle_target_year,
-                max_event_year=self._lifecycle_target_year,
-            )
-            snapshot = self._learning.get_snapshot(tour=request.tour)
-            calibration_version = snapshot.version
-            scoped_has_training = int(scoped_status.get("resolved_predictions") or 0) > 0
-            if not scoped_has_training:
-                calibration_note = (
-                    f"Learning calibration is scoped to {self._lifecycle_target_year} events and is not trained yet."
-                )
-                calibration_version = 0
-            elif snapshot.version > 0 and snapshot.markets:
-                win_metric = snapshot.markets.get("win")
-                win_brier_worse = bool(
-                    win_metric is not None
-                    and win_metric.brier_before is not None
-                    and win_metric.brier_after is not None
-                    and float(win_metric.brier_after) > (float(win_metric.brier_before) + 1e-9)
-                )
-                if win_brier_worse:
-                    calibration_note = (
-                        f"Skipped learning calibration v{snapshot.version}: "
-                        f"win Brier worsened ({win_metric.brier_before:.4f} -> {win_metric.brier_after:.4f})."
-                    )
-                else:
-                    display_win_probability = snapshot.apply("win", raw_win_probability)
-                    win_total = float(display_win_probability.sum())
-                    if win_total > 1e-12:
-                        display_win_probability = display_win_probability / win_total
-                    else:
-                        display_win_probability = raw_win_probability
-
-                    display_top_3_probability = snapshot.apply("top_3", raw_top_3_probability)
-                    display_top_5_probability = snapshot.apply("top_5", raw_top_5_probability)
-                    display_top_10_probability = snapshot.apply("top_10", raw_top_10_probability)
-
-                    display_top_3_probability = np.maximum(
-                        display_top_3_probability,
-                        display_win_probability,
-                    )
-                    display_top_5_probability = np.maximum(
-                        display_top_5_probability,
-                        display_top_3_probability,
-                    )
-                    display_top_10_probability = np.maximum(
-                        display_top_10_probability,
-                        display_top_5_probability,
-                    )
-                    display_top_3_probability = np.clip(display_top_3_probability, 0.0, 1.0)
-                    display_top_5_probability = np.clip(display_top_5_probability, 0.0, 1.0)
-                    display_top_10_probability = np.clip(display_top_10_probability, 0.0, 1.0)
-                    calibration_applied = True
-                    calibration_note = (
-                        f"Applied learning calibration v{snapshot.version} from historical outcomes."
-                    )
-            elif snapshot.version <= 0:
-                calibration_note = (
-                    "Learning calibration is not trained yet. Run outcome sync + retrain."
-                )
-            else:
-                calibration_note = (
-                    "Learning calibration loaded, but no per-market parameters were available."
-                )
+        (
+            display_win_probability,
+            display_top_3_probability,
+            display_top_5_probability,
+            display_top_10_probability,
+            calibration_applied,
+            calibration_version,
+            calibration_note,
+        ) = self._apply_learning_calibration(
+            tour=request.tour,
+            raw_win_probability=raw_win_probability,
+            raw_top_3_probability=raw_top_3_probability,
+            raw_top_5_probability=raw_top_5_probability,
+            raw_top_10_probability=raw_top_10_probability,
+        )
 
         rankings = np.argsort(display_win_probability)[::-1]
         result_rows: list[PlayerSimulationOutput] = []
@@ -753,6 +827,148 @@ class SimulationService:
             max_players=max_players,
         )
         return LearningEventTrendsResponse(**payload)
+
+    async def get_latest_snapshot(
+        self,
+        *,
+        tour: str = "pga",
+        event_id: str | None = None,
+        event_year: int | None = None,
+    ) -> SimulationResponse:
+        if self._learning is None:
+            raise ValueError("Learning store is not configured.")
+
+        normalized_tour = (tour or "pga").strip().lower()
+        latest = self._learning.get_latest_prediction_snapshot(
+            tour=normalized_tour,
+            event_id=event_id,
+            event_year=event_year,
+        )
+        if latest is None:
+            event_scope = f"event_id={event_id}" if event_id else "tour scope"
+            raise LookupError(f"No stored snapshot found for {event_scope}.")
+
+        snapshot_players = list(latest.get("players") or [])
+        if not snapshot_players:
+            raise LookupError("Stored snapshot exists but has no player probabilities.")
+
+        raw_win_probability = np.asarray(
+            [float(row.get("win_probability") or 0.0) for row in snapshot_players],
+            dtype=np.float64,
+        )
+        raw_top_3_probability = np.asarray(
+            [float(row.get("top_3_probability") or 0.0) for row in snapshot_players],
+            dtype=np.float64,
+        )
+        raw_top_5_probability = np.asarray(
+            [float(row.get("top_5_probability") or 0.0) for row in snapshot_players],
+            dtype=np.float64,
+        )
+        raw_top_10_probability = np.asarray(
+            [float(row.get("top_10_probability") or 0.0) for row in snapshot_players],
+            dtype=np.float64,
+        )
+
+        (
+            display_win_probability,
+            display_top_3_probability,
+            display_top_5_probability,
+            display_top_10_probability,
+            calibration_applied,
+            calibration_version,
+            calibration_note,
+        ) = self._apply_learning_calibration(
+            tour=normalized_tour,
+            raw_win_probability=raw_win_probability,
+            raw_top_3_probability=raw_top_3_probability,
+            raw_top_5_probability=raw_top_5_probability,
+            raw_top_10_probability=raw_top_10_probability,
+        )
+
+        live_records_by_key: dict[str, _PlayerRecord] = {}
+        try:
+            field_payload = await self._datagolf.get_field_updates(
+                tour=normalized_tour,
+                event_id=(latest.get("event_id") if latest.get("event_id") else None),
+            )
+            field_rows = _extract_rows(field_payload, ("field", "player"))
+            live_records = self._merge_player_records(field_rows, [], [], [])
+            for live_record in live_records:
+                id_key = _snapshot_player_lookup_key(live_record.player_id, None)
+                if id_key:
+                    live_records_by_key[id_key] = live_record
+                name_key = _snapshot_player_lookup_key(None, live_record.player_name)
+                if name_key:
+                    live_records_by_key[name_key] = live_record
+        except DataGolfAPIError:
+            pass
+
+        rankings = np.argsort(display_win_probability)[::-1]
+        result_rows: list[PlayerSimulationOutput] = []
+        for rank, idx in enumerate(rankings, start=1):
+            source_row = snapshot_players[int(idx)]
+            player_id = str(source_row.get("player_id") or "").strip()
+            player_name = str(source_row.get("player_name") or "").strip() or "Unknown Player"
+            lookup_key = _snapshot_player_lookup_key(player_id, player_name)
+            live_record = live_records_by_key.get(lookup_key) if lookup_key else None
+
+            resolved_player_id = player_id or f"snapshot-{rank}"
+            result_rows.append(
+                PlayerSimulationOutput(
+                    player_id=resolved_player_id,
+                    player_name=player_name,
+                    win_probability=float(display_win_probability[idx]),
+                    top_3_probability=float(display_top_3_probability[idx]),
+                    top_5_probability=float(display_top_5_probability[idx]),
+                    top_10_probability=float(display_top_10_probability[idx]),
+                    mean_finish=float(rank),
+                    mean_total_relative_to_field=0.0,
+                    current_position=(live_record.current_position if live_record else None),
+                    current_score_to_par=(live_record.current_score_to_par if live_record else None),
+                    current_thru=(live_record.current_thru if live_record else None),
+                    today_score_to_par=(live_record.today_score_to_par if live_record else None),
+                    round_scores=(live_record.round_scores if live_record else []),
+                    hole_scores=(live_record.hole_scores if live_record else []),
+                )
+            )
+
+        snapshot_generated_at = latest.get("created_at")
+        generated_at = (
+            snapshot_generated_at
+            if isinstance(snapshot_generated_at, datetime)
+            else datetime.now(timezone.utc)
+        )
+        simulation_count = int(latest.get("simulations") or 0)
+        requested_count = int(latest.get("requested_simulations") or simulation_count)
+
+        note_parts = ["Loaded latest persisted snapshot from DB."]
+        if live_records_by_key:
+            note_parts.append("Live leaderboard enrichment applied from current field feed.")
+
+        return SimulationResponse(
+            generated_at=generated_at,
+            tour=normalized_tour,
+            event_id=_to_str(latest.get("event_id")),
+            event_name=_to_str(latest.get("event_name")),
+            simulation_version=int(latest.get("simulation_version") or 1),
+            simulations=max(0, simulation_count),
+            requested_simulations=max(0, requested_count),
+            adaptive_stopped_early=False,
+            win_ci_half_width_top_n=None,
+            ci_target_met=False,
+            stop_reason="snapshot_loaded_from_db",
+            recommended_simulations=None,
+            in_play_conditioning_applied=bool(latest.get("in_play_applied")),
+            in_play_conditioning_note=" ".join(note_parts).strip(),
+            baseline_season=None,
+            current_season=None,
+            form_adjustment_applied=False,
+            form_adjustment_note="Loaded persisted snapshot from DB (no new seasonal recalculation).",
+            calibration_applied=calibration_applied,
+            calibration_version=calibration_version,
+            calibration_note=calibration_note,
+            players=result_rows,
+        )
 
     async def get_lifecycle_status(self, tour: str = "pga") -> LifecycleStatusResponse:
         normalized_tour = (tour or "pga").strip().lower()
@@ -3156,6 +3372,16 @@ def _resolved_snapshot_type(request_snapshot_type: Any, in_play_applied: bool) -
     if text in {"manual", "live", "pre_event"}:
         return text
     return "live" if in_play_applied else "manual"
+
+
+def _snapshot_player_lookup_key(player_id: Any, player_name: Any) -> str:
+    player_id_text = str(player_id or "").strip()
+    if player_id_text:
+        return f"id::{player_id_text}"
+    normalized_name = _normalized_name(player_name)
+    if normalized_name:
+        return f"name::{normalized_name}"
+    return ""
 
 
 def _record_progress_state(record: _PlayerRecord, total_rounds: int = 4) -> tuple[bool, bool, bool]:

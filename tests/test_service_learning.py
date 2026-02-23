@@ -321,6 +321,39 @@ def test_service_simulation_falls_back_when_pre_tournament_feed_errors(tmp_path)
     assert "Data feed fallback:" in result.in_play_conditioning_note
 
 
+def test_service_loads_latest_snapshot_from_db(tmp_path) -> None:
+    learning_store = LearningStore(str(tmp_path / "service_learning_latest_snapshot.sqlite3"))
+    service = SimulationService(
+        _LearningClient(),
+        learning_store=learning_store,
+        lifecycle_target_year=2025,
+    )
+
+    simulated = asyncio.run(
+        service.simulate(
+            SimulationRequest(
+                tour="pga",
+                simulations=4000,
+                seed=17,
+                enable_in_play_conditioning=False,
+                enable_seasonal_form=False,
+            )
+        )
+    )
+    assert simulated.event_id == "14"
+
+    loaded = asyncio.run(
+        service.get_latest_snapshot(
+            tour="pga",
+            event_id="14",
+        )
+    )
+    assert loaded.event_id == "14"
+    assert loaded.simulation_version == simulated.simulation_version
+    assert loaded.stop_reason == "snapshot_loaded_from_db"
+    assert len(loaded.players) >= 8
+
+
 def test_service_simulation_falls_back_when_field_feed_errors(tmp_path) -> None:
     learning_store = LearningStore(str(tmp_path / "service_learning_field_fallback.sqlite3"))
     service = SimulationService(

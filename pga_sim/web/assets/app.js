@@ -1106,6 +1106,55 @@ async function loadEventTrendsForCurrentEvent({ silent = true } = {}) {
   }
 }
 
+async function loadLatestSnapshotFromDb({ silent = true, runIfMissing = true } = {}) {
+  const tourValue = ui.tourSelect.value;
+  const selectedEventId = (ui.eventSelect?.value || "").trim();
+  const query = new URLSearchParams({ tour: tourValue });
+  if (selectedEventId) {
+    query.set("event_id", selectedEventId);
+  }
+  try {
+    const response = await fetch(`/learning/latest-snapshot?${query.toString()}`);
+    if (response.status === 404) {
+      if (runIfMissing && !state.simulationInFlight) {
+        setStatus(
+          "No stored snapshot found for selected event. Running initial simulation...",
+          true
+        );
+        await runSimulation(false);
+        return;
+      }
+      if (!silent) {
+        setStatus("No stored snapshot found for the selected event.");
+      }
+      return;
+    }
+    if (!response.ok) {
+      let detail = `Unable to load latest snapshot (${response.status})`;
+      try {
+        const errPayload = await response.json();
+        if (errPayload?.detail) {
+          detail = String(errPayload.detail);
+        }
+      } catch (_) {
+        // Keep default detail message when body is not JSON.
+      }
+      throw new Error(detail);
+    }
+
+    const payload = await response.json();
+    renderResult(payload);
+    await loadEventTrendsForCurrentEvent({ silent: true });
+    setStatus(
+      `Loaded latest snapshot from DB: v${Number(payload.simulation_version || 1)} (${Number(payload.simulations || 0).toLocaleString()} sims).`
+    );
+  } catch (error) {
+    if (!silent) {
+      setError(error.message || "Unexpected error while loading latest snapshot.");
+    }
+  }
+}
+
 function stopAutoRefresh() {
   if (state.autoRefreshTimerId != null) {
     window.clearInterval(state.autoRefreshTimerId);
@@ -1522,6 +1571,7 @@ function bindEvents() {
     resetEventTrends();
     void loadEvents().then(() => {
       startAutoSimulation();
+      void loadLatestSnapshotFromDb({ silent: true });
     });
     void loadLearningStatus(true);
     void loadLifecycleStatus(true);
@@ -1529,6 +1579,7 @@ function bindEvents() {
   if (ui.eventSelect) {
     ui.eventSelect.addEventListener("change", () => {
       resetEventTrends();
+      void loadLatestSnapshotFromDb({ silent: true });
     });
   }
   if (ui.liveAutoRefreshSelect) {
@@ -1599,6 +1650,7 @@ function init() {
   updateVersionCallouts();
   void loadEvents().then(() => {
     startAutoSimulation();
+    void loadLatestSnapshotFromDb({ silent: true });
   });
   loadLearningStatus(true);
   loadLifecycleStatus(true);

@@ -221,6 +221,26 @@ async def lifecycle_status(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/learning/latest-snapshot", response_model=SimulationResponse)
+async def learning_latest_snapshot(
+    tour: str = Query(default="pga"),
+    event_id: Optional[str] = Query(default=None),
+    event_year: Optional[int] = Query(default=None, ge=1990, le=2100),
+) -> SimulationResponse:
+    try:
+        return await _service.get_latest_snapshot(
+            tour=tour,
+            event_id=event_id,
+            event_year=event_year,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DataGolfAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/lifecycle/run", response_model=LifecycleStatusResponse)
 async def lifecycle_run(
     tour: Optional[str] = Query(default=None),

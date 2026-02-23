@@ -589,6 +589,102 @@ class LearningStore:
             "simulation_version": int(row["simulation_version"] or 1),
         }
 
+    def get_latest_prediction_snapshot(
+        self,
+        *,
+        tour: str,
+        event_id: str | None = None,
+        event_year: int | None = None,
+    ) -> dict[str, Any] | None:
+        normalized_tour = self._normalize_tour(tour)
+        normalized_event_id = _normalize_token(event_id)
+
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                  run_id,
+                  created_at,
+                  tour,
+                  event_id,
+                  event_name,
+                  event_year,
+                  event_date,
+                  simulation_version,
+                  snapshot_type,
+                  requested_simulations,
+                  simulations,
+                  enable_in_play,
+                  in_play_applied
+                FROM simulation_runs
+                WHERE tour = ?
+                  AND event_id IS NOT NULL
+                  AND (? IS NULL OR event_id = ?)
+                  AND (? IS NULL OR event_year = ?)
+                ORDER BY created_at DESC, simulation_version DESC
+                LIMIT 1
+                """,
+                (
+                    normalized_tour,
+                    normalized_event_id,
+                    normalized_event_id,
+                    event_year,
+                    event_year,
+                ),
+            ).fetchone()
+
+            if row is None:
+                return None
+
+            player_rows = conn.execute(
+                """
+                SELECT
+                  player_key,
+                  player_id,
+                  player_name,
+                  win_prob,
+                  top3_prob,
+                  top5_prob,
+                  top10_prob
+                FROM simulation_players
+                WHERE run_id = ?
+                ORDER BY win_prob DESC, player_name ASC, player_key ASC
+                """,
+                (str(row["run_id"]),),
+            ).fetchall()
+
+        return {
+            "run_id": str(row["run_id"]),
+            "created_at": _parse_iso_datetime(row["created_at"]),
+            "tour": str(row["tour"]),
+            "event_id": str(row["event_id"]) if row["event_id"] is not None else None,
+            "event_name": row["event_name"],
+            "event_year": int(row["event_year"]) if row["event_year"] is not None else None,
+            "event_date": row["event_date"],
+            "simulation_version": int(row["simulation_version"] or 1),
+            "snapshot_type": _normalize_snapshot_type(row["snapshot_type"]),
+            "requested_simulations": (
+                int(row["requested_simulations"])
+                if row["requested_simulations"] is not None
+                else None
+            ),
+            "simulations": int(row["simulations"]) if row["simulations"] is not None else None,
+            "enable_in_play": bool(int(row["enable_in_play"])),
+            "in_play_applied": bool(int(row["in_play_applied"])),
+            "players": [
+                {
+                    "player_key": str(player_row["player_key"]),
+                    "player_id": player_row["player_id"],
+                    "player_name": player_row["player_name"],
+                    "win_probability": float(player_row["win_prob"]),
+                    "top_3_probability": float(player_row["top3_prob"]),
+                    "top_5_probability": float(player_row["top5_prob"]),
+                    "top_10_probability": float(player_row["top10_prob"]),
+                }
+                for player_row in player_rows
+            ],
+        }
+
     def list_event_lifecycle(
         self,
         *,

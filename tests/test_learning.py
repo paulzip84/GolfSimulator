@@ -473,6 +473,64 @@ def test_learning_store_tracks_pre_event_snapshot_lifecycle(tmp_path) -> None:
     assert lifecycle_rows[0]["pre_event_snapshot_version"] == 1
 
 
+def test_learning_store_returns_latest_prediction_snapshot(tmp_path) -> None:
+    db_path = tmp_path / "learning_latest_snapshot.sqlite3"
+    store = LearningStore(str(db_path))
+
+    players = [
+        {
+            "player_id": "9101",
+            "player_name": "Snapshot A",
+            "win_probability": 0.20,
+            "top_3_probability": 0.45,
+            "top_5_probability": 0.60,
+            "top_10_probability": 0.80,
+        },
+        {
+            "player_id": "9102",
+            "player_name": "Snapshot B",
+            "win_probability": 0.10,
+            "top_3_probability": 0.30,
+            "top_5_probability": 0.48,
+            "top_10_probability": 0.70,
+        },
+    ]
+
+    store.record_prediction(
+        tour="pga",
+        event_id="14",
+        event_name="Masters Tournament",
+        event_date="2025-04-10",
+        requested_simulations=10000,
+        simulations=10000,
+        enable_in_play=True,
+        in_play_applied=False,
+        players=players,
+    )
+    store.record_prediction(
+        tour="pga",
+        event_id="15",
+        event_name="RBC Heritage",
+        event_date="2025-04-17",
+        requested_simulations=10000,
+        simulations=10000,
+        enable_in_play=True,
+        in_play_applied=False,
+        players=players,
+    )
+
+    latest_any = store.get_latest_prediction_snapshot(tour="pga")
+    assert latest_any is not None
+    assert latest_any["event_id"] == "15"
+    assert int(latest_any["simulation_version"]) == 1
+    assert len(latest_any["players"]) == 2
+
+    latest_event = store.get_latest_prediction_snapshot(tour="pga", event_id="14")
+    assert latest_event is not None
+    assert latest_event["event_id"] == "14"
+    assert len(latest_event["players"]) == 2
+
+
 def test_learning_store_reconciles_event_year_mismatch_from_dates(tmp_path) -> None:
     db_path = tmp_path / "learning_year_reconcile.sqlite3"
     store = LearningStore(str(db_path))
