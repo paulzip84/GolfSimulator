@@ -3,6 +3,7 @@ from pga_sim.service import (
     _derive_total_to_par_from_round_data,
     _extract_live_score_snapshot,
     _extract_rows,
+    _provisional_outcome_rows,
     _probability_from_keys,
     _score_to_par_from_value,
 )
@@ -221,3 +222,37 @@ def test_merge_player_records_infers_final_thru_from_full_round_scorecard() -> N
     record = records[0]
     assert record.current_thru == "F"
     assert record.current_score_to_par == -11.0
+
+
+def test_provisional_outcomes_treat_cut_players_as_complete() -> None:
+    service = SimulationService(object())  # type: ignore[arg-type]
+    field_rows = []
+    for idx in range(1, 13):
+        row = {
+            "player_id": str(idx),
+            "player_name": f"Player {idx}",
+            "score_to_par": float(-15 + idx),
+        }
+        if idx in {11, 12}:
+            row.update(
+                {
+                    "position": "CUT",
+                    # Some feeds mark cut players with zero thru/holes played in weekend rounds.
+                    "thru": "0",
+                    "round_scores": [72, 74],
+                }
+            )
+        else:
+            row.update(
+                {
+                    "position": str(idx),
+                    "thru": "F",
+                    "round_scores": [70, 69, 68, 67],
+                }
+            )
+        field_rows.append(row)
+
+    records = service._merge_player_records(field_rows, [], [], [])
+    provisional_rows, leaderboard_complete = _provisional_outcome_rows(records)
+    assert leaderboard_complete is True
+    assert len(provisional_rows) >= 10

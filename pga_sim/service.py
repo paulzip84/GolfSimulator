@@ -2119,7 +2119,7 @@ def _normalize_position_value(value: Any) -> str | None:
         return None
 
     normalized = text.upper().replace("−", "-")
-    if normalized in {"WD", "MC", "DQ", "DNS", "DNF"}:
+    if normalized in {"WD", "MC", "DQ", "CUT", "MDF", "DNS", "DNF"}:
         return normalized
 
     tie_match = re.fullmatch(r"T\s*([+-]?\d+(?:\.\d+)?)", normalized)
@@ -2218,7 +2218,7 @@ def _record_progress_state(record: _PlayerRecord, total_rounds: int = 4) -> tupl
     thru_holes = _thru_to_hole_count(thru_normalized)
     if thru_normalized is not None:
         known = True
-        if thru_normalized in {"MC", "WD", "DQ"}:
+        if thru_normalized in {"MC", "WD", "DQ", "CUT", "MDF"}:
             complete = True
         elif thru_holes is not None:
             if thru_holes >= 18:
@@ -2227,7 +2227,7 @@ def _record_progress_state(record: _PlayerRecord, total_rounds: int = 4) -> tupl
                 in_progress = True
 
     position_normalized = _normalize_position_value(record.current_position)
-    if position_normalized in {"MC", "WD", "DQ"}:
+    if position_normalized in {"MC", "WD", "DQ", "CUT", "MDF"}:
         known = True
         complete = True
         in_progress = False
@@ -2256,7 +2256,7 @@ def _normalize_thru_value(value: Any) -> str | None:
     normalized = text.upper()
     if normalized in {"F", "FIN", "FINAL", "COMPLETE", "COMPLETED"}:
         return "F"
-    if normalized in {"WD", "MC", "DQ"}:
+    if normalized in {"WD", "MC", "DQ", "CUT", "MDF"}:
         return normalized
 
     prefix_match = re.match(r"THRU\s+(\d{1,2})$", normalized)
