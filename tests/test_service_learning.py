@@ -161,6 +161,7 @@ def test_service_logs_predictions_and_retrains_learning(tmp_path) -> None:
         )
     )
     assert result.event_id == "14"
+    assert result.simulation_version == 1
     assert result.calibration_applied is False
 
     before = asyncio.run(service.get_learning_status(tour="pga"))
@@ -217,6 +218,7 @@ def test_service_sync_uses_provisional_outcomes_when_official_feed_lags(tmp_path
         )
     )
     assert result.event_id == "99"
+    assert result.simulation_version == 1
     assert result.players[0].current_thru == "F"
 
     sync = asyncio.run(service.sync_learning_and_retrain(tour="pga", max_events=10))

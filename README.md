@@ -75,6 +75,7 @@ The GUI lets you:
 - Run the model with one click.
 - View top players and probabilities (win/top 3/top 5/top 10) in table + chart form.
 - Inspect seasonal diagnostics in the UI status line (events/players loaded per season and matched active-field players).
+- Track per-event simulation snapshot versions (`v1`, `v2`, ...) for before-round and in-play comparisons.
 
 If you prefer the installed command, run:
 
@@ -184,6 +185,9 @@ curl -X POST "http://127.0.0.1:8000/simulate" \
 - Live probability movement:
   - Enable `Live Auto-Refresh` in the GUI to rerun in-play conditioned simulations on a cadence.
   - Expanded player rows show win-probability trend snapshots and deltas over the tournament.
+- Simulation snapshot versioning:
+  - Every logged run stores an event-scoped `simulation_version` that increments per event-year (`v1`, `v2`, ...).
+  - Versions are shown in the GUI summary card and trend snapshots to support pre-round vs. final-outcome review.
 
 ## Secure web deployment (recommended)
 

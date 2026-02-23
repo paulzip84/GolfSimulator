@@ -514,6 +514,7 @@ class SimulationService:
             tour=request.tour,
             event_id=event_id,
             event_name=event_name,
+            simulation_version=1,
             simulations=outputs.simulations_run,
             requested_simulations=request.simulations,
             adaptive_stopped_early=outputs.adaptive_stopped_early,
@@ -532,7 +533,7 @@ class SimulationService:
             calibration_note=calibration_note,
             players=result_rows,
         )
-        self._record_learning_prediction(
+        recorded_version = self._record_learning_prediction(
             request=request,
             response=response,
             players=players,
@@ -543,6 +544,8 @@ class SimulationService:
             event_date=event_date,
             in_play_applied=in_play_context.applied,
         )
+        if recorded_version > 0:
+            response.simulation_version = recorded_version
         return response
 
     async def get_learning_status(self, tour: str = "pga") -> LearningStatusResponse:
@@ -798,9 +801,9 @@ class SimulationService:
         raw_top_10_probability: np.ndarray,
         event_date: str | None,
         in_play_applied: bool,
-    ) -> None:
+    ) -> int:
         if self._learning is None:
-            return
+            return 0
         try:
             player_rows: list[dict[str, Any]] = []
             for idx, record in enumerate(players):
@@ -814,7 +817,7 @@ class SimulationService:
                         "top_10_probability": float(raw_top_10_probability[idx]),
                     }
                 )
-            self._learning.record_prediction(
+            _, logged_version = self._learning.record_prediction(
                 tour=response.tour,
                 event_id=response.event_id,
                 event_name=response.event_name,
@@ -825,9 +828,10 @@ class SimulationService:
                 in_play_applied=in_play_applied,
                 players=player_rows,
             )
+            return int(logged_version)
         except Exception:
             # Never block simulation responses on local learning persistence.
-            return
+            return 0
 
     def _merge_player_records(
         self,

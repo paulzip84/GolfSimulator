@@ -78,6 +78,7 @@ class LearningStore:
                   event_name TEXT,
                   event_year INTEGER,
                   event_date TEXT,
+                  simulation_version INTEGER NOT NULL DEFAULT 1,
                   requested_simulations INTEGER,
                   simulations INTEGER,
                   enable_in_play INTEGER NOT NULL DEFAULT 1,
@@ -138,11 +139,48 @@ class LearningStore:
                   ON simulation_players (player_key);
                 """
             )
+            if not _table_has_column(conn, "simulation_runs", "simulation_version"):
+                conn.execute(
+                    """
+                    ALTER TABLE simulation_runs
+                    ADD COLUMN simulation_version INTEGER NOT NULL DEFAULT 1
+                    """
+                )
+            conn.execute(
+                """
+                UPDATE simulation_runs
+                SET simulation_version = 1
+                WHERE simulation_version IS NULL
+                """
+            )
             conn.commit()
 
     @staticmethod
     def _normalize_tour(tour: str) -> str:
         return (tour or "pga").strip().lower()
+
+    def peek_next_simulation_version(
+        self,
+        *,
+        tour: str,
+        event_id: str | None,
+        event_date: str | None,
+    ) -> int:
+        normalized_tour = self._normalize_tour(tour)
+        normalized_event_id = _normalize_token(event_id)
+        with self._lock, self._connect() as conn:
+            event_year = self._resolve_event_year_locked(
+                conn=conn,
+                normalized_tour=normalized_tour,
+                normalized_event_id=normalized_event_id,
+                event_date=event_date,
+            )
+            return self._next_simulation_version_locked(
+                conn=conn,
+                normalized_tour=normalized_tour,
+                normalized_event_id=normalized_event_id,
+                event_year=event_year,
+            )
 
     def record_prediction(
         self,
@@ -155,24 +193,41 @@ class LearningStore:
         simulations: int | None,
         enable_in_play: bool,
         in_play_applied: bool,
+        simulation_version: int | None = None,
         players: list[dict[str, Any]],
-    ) -> str:
+    ) -> tuple[str, int]:
         if not players:
-            return ""
+            return "", 0
 
         normalized_tour = self._normalize_tour(tour)
         normalized_event_id = _normalize_token(event_id)
-        event_year = _year_from_date(event_date)
         run_id = str(uuid.uuid4())
         created_at = datetime.now(timezone.utc).isoformat()
 
         with self._lock, self._connect() as conn:
+            event_year = self._resolve_event_year_locked(
+                conn=conn,
+                normalized_tour=normalized_tour,
+                normalized_event_id=normalized_event_id,
+                event_date=event_date,
+            )
+            resolved_simulation_version = (
+                int(simulation_version) if simulation_version is not None else 0
+            )
+            if resolved_simulation_version <= 0:
+                resolved_simulation_version = self._next_simulation_version_locked(
+                    conn=conn,
+                    normalized_tour=normalized_tour,
+                    normalized_event_id=normalized_event_id,
+                    event_year=event_year,
+                )
+
             conn.execute(
                 """
                 INSERT INTO simulation_runs (
                   run_id, created_at, tour, event_id, event_name, event_year, event_date,
-                  requested_simulations, simulations, enable_in_play, in_play_applied
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  simulation_version, requested_simulations, simulations, enable_in_play, in_play_applied
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -182,6 +237,7 @@ class LearningStore:
                     event_name,
                     event_year,
                     event_date,
+                    resolved_simulation_version,
                     requested_simulations,
                     simulations,
                     int(enable_in_play),
@@ -220,7 +276,74 @@ class LearningStore:
                 )
             conn.commit()
 
-        return run_id
+        return run_id, int(resolved_simulation_version)
+
+    def _resolve_event_year_locked(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        normalized_tour: str,
+        normalized_event_id: str | None,
+        event_date: str | None,
+    ) -> int | None:
+        parsed_year = _year_from_date(event_date)
+        if parsed_year is not None:
+            return parsed_year
+        if not normalized_event_id:
+            return None
+        row = conn.execute(
+            """
+            SELECT event_year
+            FROM simulation_runs
+            WHERE tour = ?
+              AND event_id = ?
+              AND event_year IS NOT NULL
+            ORDER BY event_year DESC, created_at DESC
+            LIMIT 1
+            """,
+            (normalized_tour, normalized_event_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row["event_year"])
+
+    def _next_simulation_version_locked(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        normalized_tour: str,
+        normalized_event_id: str | None,
+        event_year: int | None,
+    ) -> int:
+        if normalized_event_id and event_year is not None:
+            row = conn.execute(
+                """
+                SELECT COALESCE(MAX(simulation_version), 0)
+                FROM simulation_runs
+                WHERE tour = ? AND event_id = ? AND event_year = ?
+                """,
+                (normalized_tour, normalized_event_id, int(event_year)),
+            ).fetchone()
+            return int(row[0] or 0) + 1
+        if normalized_event_id:
+            row = conn.execute(
+                """
+                SELECT COALESCE(MAX(simulation_version), 0)
+                FROM simulation_runs
+                WHERE tour = ? AND event_id = ?
+                """,
+                (normalized_tour, normalized_event_id),
+            ).fetchone()
+            return int(row[0] or 0) + 1
+        row = conn.execute(
+            """
+            SELECT COALESCE(MAX(simulation_version), 0)
+            FROM simulation_runs
+            WHERE tour = ?
+            """,
+            (normalized_tour,),
+        ).fetchone()
+        return int(row[0] or 0) + 1
 
     def list_pending_events(
         self,
@@ -556,6 +679,7 @@ class LearningStore:
                         "event_name": None,
                         "snapshot_count": 0,
                         "latest_run_id": None,
+                        "latest_simulation_version": None,
                         "snapshots": [],
                         "players": [],
                     }
@@ -563,7 +687,13 @@ class LearningStore:
 
             snapshot_rows = conn.execute(
                 """
-                SELECT run_id, created_at, simulations, in_play_applied, event_name
+                SELECT
+                  run_id,
+                  created_at,
+                  simulation_version,
+                  simulations,
+                  in_play_applied,
+                  event_name
                 FROM simulation_runs
                 WHERE tour = ?
                   AND event_id = ?
@@ -587,6 +717,7 @@ class LearningStore:
                     "event_name": None,
                     "snapshot_count": 0,
                     "latest_run_id": None,
+                    "latest_simulation_version": None,
                     "snapshots": [],
                     "players": [],
                 }
@@ -605,7 +736,8 @@ class LearningStore:
                   sp.top3_prob AS top3_prob,
                   sp.top5_prob AS top5_prob,
                   sp.top10_prob AS top10_prob,
-                  r.created_at AS created_at
+                  r.created_at AS created_at,
+                  r.simulation_version AS simulation_version
                 FROM simulation_players sp
                 JOIN simulation_runs r
                   ON r.run_id = sp.run_id
@@ -619,6 +751,7 @@ class LearningStore:
             str(row["run_id"]): {
                 "run_id": str(row["run_id"]),
                 "created_at": _parse_iso_datetime(row["created_at"]),
+                "simulation_version": int(row["simulation_version"] or 1),
                 "simulations": int(row["simulations"]) if row["simulations"] is not None else None,
                 "in_play_applied": bool(int(row["in_play_applied"])),
             }
@@ -640,6 +773,7 @@ class LearningStore:
             point = {
                 "run_id": str(row["run_id"]),
                 "created_at": _parse_iso_datetime(row["created_at"]),
+                "simulation_version": int(row["simulation_version"] or 1),
                 "win_probability": float(row["win_prob"]),
                 "top_3_probability": float(row["top3_prob"]),
                 "top_5_probability": float(row["top5_prob"]),
@@ -656,6 +790,9 @@ class LearningStore:
                 "event_name": event_name,
                 "snapshot_count": len(snapshot_rows),
                 "latest_run_id": run_order[-1] if run_order else None,
+                "latest_simulation_version": snapshot_by_run.get(run_order[-1], {}).get("simulation_version")
+                if run_order
+                else None,
                 "snapshots": list(snapshot_by_run.values()),
                 "players": [],
             }
@@ -713,6 +850,9 @@ class LearningStore:
             "event_name": event_name,
             "snapshot_count": len(snapshot_rows),
             "latest_run_id": run_order[-1] if run_order else None,
+            "latest_simulation_version": snapshot_by_run.get(run_order[-1], {}).get("simulation_version")
+            if run_order
+            else None,
             "snapshots": list(snapshot_by_run.values()),
             "players": players_payload,
         }
@@ -1005,3 +1145,11 @@ def _parse_iso_datetime(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _table_has_column(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    for row in rows:
+        if str(row["name"]).strip().lower() == column_name.strip().lower():
+            return True
+    return False

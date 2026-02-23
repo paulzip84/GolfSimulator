@@ -68,6 +68,7 @@ class SimulationResponse(BaseModel):
     tour: str
     event_id: Optional[str]
     event_name: Optional[str]
+    simulation_version: int = 1
     simulations: int
     requested_simulations: Optional[int] = None
     adaptive_stopped_early: bool = False
@@ -130,6 +131,7 @@ class LearningSyncResponse(LearningStatusResponse):
 class LearningEventSnapshot(BaseModel):
     run_id: str
     created_at: datetime
+    simulation_version: int = 1
     simulations: Optional[int] = None
     in_play_applied: bool = False
 
@@ -137,6 +139,7 @@ class LearningEventSnapshot(BaseModel):
 class LearningEventTrendPoint(BaseModel):
     run_id: str
     created_at: datetime
+    simulation_version: int = 1
     win_probability: float
     top_3_probability: float
     top_5_probability: float
@@ -162,5 +165,6 @@ class LearningEventTrendsResponse(BaseModel):
     event_name: Optional[str] = None
     snapshot_count: int = 0
     latest_run_id: Optional[str] = None
+    latest_simulation_version: Optional[int] = None
     snapshots: list[LearningEventSnapshot] = Field(default_factory=list)
     players: list[LearningPlayerEventTrend] = Field(default_factory=list)

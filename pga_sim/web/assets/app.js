@@ -195,6 +195,7 @@ const ui = {
   resultsSection: document.getElementById("resultsSection"),
   eventLabel: document.getElementById("eventLabel"),
   simLabel: document.getElementById("simLabel"),
+  snapshotLabel: document.getElementById("snapshotLabel"),
   generatedLabel: document.getElementById("generatedLabel"),
   winnerLabel: document.getElementById("winnerLabel"),
   seasonWindowLabel: document.getElementById("seasonWindowLabel"),
@@ -630,7 +631,10 @@ function buildScorecardDetails(player) {
     if (lastPoint && lastPoint.created_at) {
       const meta = document.createElement("div");
       meta.className = "trend-meta";
-      meta.textContent = `Latest snapshot: ${formatDate(lastPoint.created_at)}`;
+      const versionText = Number.isFinite(Number(lastPoint.simulation_version))
+        ? `v${Number(lastPoint.simulation_version)}`
+        : "v?";
+      meta.textContent = `Latest snapshot ${versionText}: ${formatDate(lastPoint.created_at)}`;
       trendBlock.appendChild(meta);
     }
     wrapper.appendChild(trendBlock);
@@ -1011,6 +1015,9 @@ function renderResult(payload) {
   } else {
     ui.simLabel.textContent = payload.simulations.toLocaleString();
   }
+  if (ui.snapshotLabel) {
+    ui.snapshotLabel.textContent = `v${Number(payload.simulation_version || 1)}`;
+  }
   ui.generatedLabel.textContent = formatDate(payload.generated_at);
   ui.winnerLabel.textContent = topPlayer
     ? `${topPlayer.player_name} (${formatPct(topPlayer.win_probability)})`
@@ -1156,6 +1163,9 @@ async function runSimulation(fromAutoRefresh = false) {
     }
     if (payload.calibration_note) {
       statusBits.push(payload.calibration_note);
+    }
+    if (payload.simulation_version != null) {
+      statusBits.push(`snapshot=v${Number(payload.simulation_version)}`);
     }
     setStatus(statusBits.length > 0 ? `Simulation complete. ${statusBits.join(" | ")}` : "Simulation complete.");
     void loadLearningStatus(true);

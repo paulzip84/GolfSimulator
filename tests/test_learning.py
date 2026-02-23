@@ -343,12 +343,81 @@ def test_event_trends_returns_snapshot_deltas(tmp_path) -> None:
     )
     assert trends["snapshot_count"] == 2
     assert trends["latest_run_id"] is not None
+    assert trends["latest_simulation_version"] == 2
+    assert [int(snapshot["simulation_version"]) for snapshot in trends["snapshots"]] == [1, 2]
     assert len(trends["players"]) == 2
 
     alpha = next(player for player in trends["players"] if player["player_id"] == "5001")
     assert len(alpha["points"]) == 2
+    assert [int(point["simulation_version"]) for point in alpha["points"]] == [1, 2]
     assert alpha["delta_win_since_first"] > 0
     assert alpha["delta_win_since_previous"] > 0
+
+
+def test_simulation_version_resets_by_event_year(tmp_path) -> None:
+    db_path = tmp_path / "learning_versions.sqlite3"
+    store = LearningStore(str(db_path))
+
+    players = [
+        {
+            "player_id": "7001",
+            "player_name": "Version Player",
+            "win_probability": 0.2,
+            "top_3_probability": 0.45,
+            "top_5_probability": 0.62,
+            "top_10_probability": 0.81,
+        },
+        {
+            "player_id": "7002",
+            "player_name": "Version Player 2",
+            "win_probability": 0.1,
+            "top_3_probability": 0.3,
+            "top_5_probability": 0.48,
+            "top_10_probability": 0.7,
+        },
+    ]
+
+    store.record_prediction(
+        tour="pga",
+        event_id="14",
+        event_name="Masters Tournament",
+        event_date="2025-04-10",
+        requested_simulations=10000,
+        simulations=10000,
+        enable_in_play=True,
+        in_play_applied=False,
+        players=players,
+    )
+    store.record_prediction(
+        tour="pga",
+        event_id="14",
+        event_name="Masters Tournament",
+        event_date="2025-04-11",
+        requested_simulations=10000,
+        simulations=10000,
+        enable_in_play=True,
+        in_play_applied=True,
+        players=players,
+    )
+    store.record_prediction(
+        tour="pga",
+        event_id="14",
+        event_name="Masters Tournament",
+        event_date="2026-04-10",
+        requested_simulations=10000,
+        simulations=10000,
+        enable_in_play=True,
+        in_play_applied=False,
+        players=players,
+    )
+
+    trends_2025 = store.event_trends(tour="pga", event_id="14", event_year=2025)
+    assert [int(snapshot["simulation_version"]) for snapshot in trends_2025["snapshots"]] == [1, 2]
+    assert trends_2025["latest_simulation_version"] == 2
+
+    trends_2026 = store.event_trends(tour="pga", event_id="14", event_year=2026)
+    assert [int(snapshot["simulation_version"]) for snapshot in trends_2026["snapshots"]] == [1]
+    assert trends_2026["latest_simulation_version"] == 1
 
 
 def test_retrain_without_observations_keeps_version_stable(tmp_path) -> None:
