@@ -256,3 +256,28 @@ def test_provisional_outcomes_treat_cut_players_as_complete() -> None:
     provisional_rows, leaderboard_complete = _provisional_outcome_rows(records)
     assert leaderboard_complete is True
     assert len(provisional_rows) >= 10
+
+
+def test_effective_simulation_batch_size_caps_large_requests() -> None:
+    service = SimulationService(
+        object(),  # type: ignore[arg-type]
+        simulation_max_batch_size=2000,
+    )
+    batch = service._effective_simulation_batch_size(
+        requested_batch_size=50_000,
+        simulation_count=1_000_000,
+        player_count=156,
+    )
+    assert batch <= 2000
+    assert batch >= 500
+
+
+def test_memory_safe_batch_cap_scales_down_for_larger_fields() -> None:
+    service = SimulationService(
+        object(),  # type: ignore[arg-type]
+        simulation_max_batch_size=10_000,
+    )
+    small_field_cap = service._memory_safe_batch_cap(player_count=32)
+    large_field_cap = service._memory_safe_batch_cap(player_count=156)
+    assert large_field_cap < small_field_cap
+    assert large_field_cap >= 500

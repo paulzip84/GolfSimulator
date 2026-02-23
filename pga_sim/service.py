@@ -204,6 +204,7 @@ class SimulationService:
         datagolf: DataGolfClient,
         learning_store: LearningStore | None = None,
         *,
+        simulation_max_batch_size: int = 2_000,
         lifecycle_automation_enabled: bool = True,
         lifecycle_tour: str = "pga",
         lifecycle_pre_event_simulations: int = 20_000,
@@ -216,6 +217,7 @@ class SimulationService:
         self._datagolf = datagolf
         self._learning = learning_store
         self._season_metrics_cache: dict[tuple[str, int], _SeasonLoadResult] = {}
+        self._simulation_max_batch_size = max(500, int(simulation_max_batch_size))
         self._lifecycle_automation_enabled = bool(lifecycle_automation_enabled)
         self._lifecycle_tour = (lifecycle_tour or "pga").strip().lower()
         self._lifecycle_pre_event_simulations = max(500, int(lifecycle_pre_event_simulations))
@@ -229,6 +231,29 @@ class SimulationService:
         self._lifecycle_lock: asyncio.Lock | None = None
         self._last_lifecycle_run_at: datetime | None = None
         self._last_lifecycle_run_note: str | None = None
+
+    def _memory_safe_batch_cap(self, *, player_count: int) -> int:
+        # cdf_rows in the simulator is the dominant allocation: chunk * players * deltas * float64.
+        # Keep this around 64 MiB so peak memory remains stable on 512 MiB Render instances.
+        players = max(1, int(player_count))
+        delta_states = 21
+        bytes_per_float64 = 8
+        target_cdf_bytes = 64 * 1024 * 1024
+        dynamic_cap = target_cdf_bytes // (players * delta_states * bytes_per_float64)
+        return max(500, int(dynamic_cap))
+
+    def _effective_simulation_batch_size(
+        self,
+        *,
+        requested_batch_size: int,
+        simulation_count: int,
+        player_count: int,
+    ) -> int:
+        requested = max(500, int(requested_batch_size))
+        capped_by_request = min(max(500, int(simulation_count)), requested)
+        static_cap = self._simulation_max_batch_size
+        dynamic_cap = self._memory_safe_batch_cap(player_count=player_count)
+        return max(500, min(capped_by_request, static_cap, dynamic_cap))
 
     async def list_upcoming_events(self, tour: str = "pga", limit: int = 12) -> list[EventSummary]:
         schedule_payload = await self._datagolf.get_schedule(tour=tour)
@@ -480,9 +505,10 @@ class SimulationService:
             int(request.simulations),
             max(500, int(request.min_simulations)),
         )
-        effective_batch_size = min(
-            int(request.simulations),
-            max(500, int(request.simulation_batch_size)),
+        effective_batch_size = self._effective_simulation_batch_size(
+            requested_batch_size=int(request.simulation_batch_size),
+            simulation_count=int(request.simulations),
+            player_count=len(players),
         )
         outputs = simulator.simulate(
             inputs=model_inputs,
@@ -956,7 +982,10 @@ class SimulationService:
                             resolution_mode="fixed_cap",
                             simulations=self._lifecycle_pre_event_simulations,
                             min_simulations=lifecycle_min_simulations,
-                            simulation_batch_size=min(10_000, self._lifecycle_pre_event_simulations),
+                            simulation_batch_size=min(
+                                self._simulation_max_batch_size,
+                                self._lifecycle_pre_event_simulations,
+                            ),
                             seed=self._lifecycle_pre_event_seed,
                             enable_adaptive_simulation=False,
                             enable_in_play_conditioning=False,
@@ -999,7 +1028,10 @@ class SimulationService:
                             resolution_mode="fixed_cap",
                             simulations=self._lifecycle_pre_event_simulations,
                             min_simulations=lifecycle_min_simulations,
-                            simulation_batch_size=min(10_000, self._lifecycle_pre_event_simulations),
+                            simulation_batch_size=min(
+                                self._simulation_max_batch_size,
+                                self._lifecycle_pre_event_simulations,
+                            ),
                             seed=self._lifecycle_pre_event_seed,
                             enable_adaptive_simulation=False,
                             enable_in_play_conditioning=True,

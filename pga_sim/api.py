@@ -34,6 +34,7 @@ _learning_store = LearningStore(_settings.learning_database_path)
 _service = SimulationService(
     _client,
     learning_store=_learning_store,
+    simulation_max_batch_size=_settings.simulation_max_batch_size,
     lifecycle_automation_enabled=_settings.lifecycle_automation_enabled,
     lifecycle_tour=_settings.lifecycle_tour,
     lifecycle_pre_event_simulations=_settings.lifecycle_pre_event_simulations,

@@ -117,7 +117,7 @@ const CONTROL_TOOLTIPS = {
   minSimulationsInput:
     "Minimum simulations to run before adaptive early-stop is allowed. If this is above Simulations, it is effectively capped at Simulations.",
   simulationBatchSizeInput:
-    "Simulations are processed in batches for adaptive checks. Larger batches are faster but stop less precisely.",
+    "Simulations are processed in batches for adaptive checks. Larger batches are faster but stop less precisely. The server applies a memory-safe cap automatically.",
   cutSizeInput:
     "Projected cut line size after round 2 (ties included).",
   meanReversionInput:
@@ -1349,7 +1349,7 @@ async function runSimulation(fromAutoRefresh = false) {
   try {
     const simulations = Number.parseInt(ui.simulationsInput.value, 10) || 10000;
     const minSimulations = Number.parseInt(ui.minSimulationsInput.value, 10) || 250000;
-    const simulationBatchSize = Number.parseInt(ui.simulationBatchSizeInput.value, 10) || 10000;
+    const simulationBatchSize = Number.parseInt(ui.simulationBatchSizeInput.value, 10) || 2000;
     const cutSize = Number.parseInt(ui.cutSizeInput.value, 10) || 70;
     const meanReversion = Number.parseFloat(ui.meanReversionInput.value) || 0.1;
     const sharedRoundShockSigma = Number.parseFloat(ui.sharedRoundShockInput.value) || 0.35;

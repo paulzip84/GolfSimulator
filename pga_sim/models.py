@@ -19,7 +19,7 @@ class SimulationRequest(BaseModel):
     resolution_mode: str = Field(default="fixed_cap")
     simulations: int = Field(default=1_000_000, ge=500, le=2_000_000)
     min_simulations: int = Field(default=250_000, ge=500, le=250_000)
-    simulation_batch_size: int = Field(default=10_000, ge=500, le=50_000)
+    simulation_batch_size: int = Field(default=2_000, ge=500, le=50_000)
     seed: Optional[int] = Field(default=None)
     cut_size: int = Field(default=70, ge=20, le=156)
     mean_reversion: float = Field(default=0.10, ge=0.0, le=0.4)
