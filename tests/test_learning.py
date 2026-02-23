@@ -76,6 +76,136 @@ def test_learning_store_records_predictions_and_outcomes(tmp_path) -> None:
     assert status["resolved_predictions"] == 8
 
 
+def test_learning_store_in_play_only_predictions_can_resolve_and_train(tmp_path) -> None:
+    db_path = tmp_path / "learning_in_play_only.sqlite3"
+    store = LearningStore(str(db_path))
+
+    players = [
+        {
+            "player_id": str(1100 + idx),
+            "player_name": f"InPlay Player {idx + 1}",
+            "win_probability": 0.03 * (idx + 1),
+            "top_3_probability": min(0.95, 0.07 * (idx + 1)),
+            "top_5_probability": min(0.98, 0.10 * (idx + 1)),
+            "top_10_probability": min(0.99, 0.13 * (idx + 1)),
+        }
+        for idx in range(8)
+    ]
+
+    store.record_prediction(
+        tour="pga",
+        event_id="99",
+        event_name="InPlay Event",
+        event_date="2025-05-10",
+        requested_simulations=8000,
+        simulations=8000,
+        enable_in_play=True,
+        in_play_applied=True,
+        players=players,
+    )
+
+    pending = store.list_pending_events(tour="pga", max_events=10)
+    assert len(pending) == 1
+    assert pending[0].event_id == "99"
+    assert pending[0].event_year == 2025
+
+    outcome_rows = [(1100 + idx, f"InPlay Player {idx + 1}", idx + 1) for idx in range(8)]
+    inserted = store.record_outcome_payload(
+        tour="pga",
+        event_id="99",
+        event_year=2025,
+        payload=_event_payload("InPlay Event", outcome_rows),
+    )
+    assert inserted == 8
+
+    snapshot = store.retrain(tour="pga")
+    assert snapshot.version == 1
+    status = store.status(tour="pga")
+    assert status["resolved_events"] == 1
+    assert status["resolved_predictions"] == 8
+
+
+def test_learning_store_prefers_pre_event_rows_over_in_play_when_both_exist(tmp_path) -> None:
+    db_path = tmp_path / "learning_preferred_pre_event.sqlite3"
+    store = LearningStore(str(db_path))
+
+    pre_players = [
+        {
+            "player_id": "2001",
+            "player_name": "Alpha",
+            "win_probability": 0.12,
+            "top_3_probability": 0.32,
+            "top_5_probability": 0.45,
+            "top_10_probability": 0.66,
+        },
+        {
+            "player_id": "2002",
+            "player_name": "Beta",
+            "win_probability": 0.08,
+            "top_3_probability": 0.24,
+            "top_5_probability": 0.36,
+            "top_10_probability": 0.58,
+        },
+    ]
+    in_play_players = [
+        {
+            "player_id": "2001",
+            "player_name": "Alpha",
+            "win_probability": 0.72,
+            "top_3_probability": 0.92,
+            "top_5_probability": 0.97,
+            "top_10_probability": 0.995,
+        },
+        {
+            "player_id": "2002",
+            "player_name": "Beta",
+            "win_probability": 0.02,
+            "top_3_probability": 0.08,
+            "top_5_probability": 0.12,
+            "top_10_probability": 0.21,
+        },
+    ]
+
+    store.record_prediction(
+        tour="pga",
+        event_id="55",
+        event_name="Preference Event",
+        event_date="2025-06-10",
+        requested_simulations=6000,
+        simulations=6000,
+        enable_in_play=True,
+        in_play_applied=False,
+        players=pre_players,
+    )
+    store.record_prediction(
+        tour="pga",
+        event_id="55",
+        event_name="Preference Event",
+        event_date="2025-06-10",
+        requested_simulations=6000,
+        simulations=6000,
+        enable_in_play=True,
+        in_play_applied=True,
+        players=in_play_players,
+    )
+    store.record_outcome_payload(
+        tour="pga",
+        event_id="55",
+        event_year=2025,
+        payload=_event_payload(
+            "Preference Event",
+            [
+                (2001, "Alpha", 1),
+                (2002, "Beta", 2),
+            ],
+        ),
+    )
+
+    training_rows = store._load_training_rows(tour="pga")
+    win_probs = sorted({round(float(row["win_prob"]), 4) for row in training_rows})
+    assert win_probs == [0.08, 0.12]
+
+
 def test_learning_retraining_updates_calibration_metrics(tmp_path) -> None:
     db_path = tmp_path / "learning_calibration.sqlite3"
     store = LearningStore(str(db_path))

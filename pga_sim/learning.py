@@ -243,7 +243,6 @@ class LearningStore:
               AND r.event_year IS NOT NULL
               AND r.event_year <= ?
               AND (r.event_date IS NULL OR substr(r.event_date, 1, 10) <= ?)
-              AND r.in_play_applied = 0
               AND (? IS NULL OR r.tour = ?)
               AND NOT EXISTS (
                 SELECT 1
@@ -489,7 +488,6 @@ class LearningStore:
                         AND r.event_id IS NOT NULL
                         AND r.event_year IS NOT NULL
                         AND (r.event_date IS NULL OR substr(r.event_date, 1, 10) <= ?)
-                        AND r.in_play_applied = 0
                         AND NOT EXISTS (
                           SELECT 1
                           FROM event_outcomes o
@@ -735,13 +733,12 @@ class LearningStore:
                 sp.top10_prob,
                 ROW_NUMBER() OVER (
                   PARTITION BY r.tour, r.event_id, r.event_year, sp.player_key
-                  ORDER BY r.created_at DESC, r.run_id DESC
+                  ORDER BY r.in_play_applied ASC, r.created_at DESC, r.run_id DESC
                 ) AS row_rank
               FROM simulation_runs r
               JOIN simulation_players sp
                 ON sp.run_id = r.run_id
               WHERE r.tour = ?
-                AND r.in_play_applied = 0
                 AND r.event_id IS NOT NULL
                 AND r.event_year IS NOT NULL
             )
