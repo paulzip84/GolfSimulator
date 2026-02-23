@@ -685,6 +685,127 @@ class LearningStore:
             ],
         }
 
+    def get_run_player_win_deltas(
+        self,
+        *,
+        run_id: str,
+    ) -> list[dict[str, Any]]:
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            return []
+
+        with self._lock, self._connect() as conn:
+            run_row = conn.execute(
+                """
+                SELECT tour, event_id, event_year, simulation_version
+                FROM simulation_runs
+                WHERE run_id = ?
+                LIMIT 1
+                """,
+                (normalized_run_id,),
+            ).fetchone()
+            if run_row is None:
+                return []
+
+            tour = str(run_row["tour"])
+            event_id = _normalize_token(run_row["event_id"])
+            event_year = int(run_row["event_year"]) if run_row["event_year"] is not None else None
+            simulation_version = (
+                int(run_row["simulation_version"])
+                if run_row["simulation_version"] is not None
+                else None
+            )
+            if not event_id or event_year is None or simulation_version is None:
+                return []
+
+            first_row = conn.execute(
+                """
+                SELECT run_id
+                FROM simulation_runs
+                WHERE tour = ?
+                  AND event_id = ?
+                  AND event_year = ?
+                ORDER BY simulation_version ASC, created_at ASC, run_id ASC
+                LIMIT 1
+                """,
+                (tour, event_id, int(event_year)),
+            ).fetchone()
+            first_run_id = str(first_row["run_id"]) if first_row is not None else normalized_run_id
+
+            previous_row = conn.execute(
+                """
+                SELECT run_id
+                FROM simulation_runs
+                WHERE tour = ?
+                  AND event_id = ?
+                  AND event_year = ?
+                  AND simulation_version < ?
+                ORDER BY simulation_version DESC, created_at DESC, run_id DESC
+                LIMIT 1
+                """,
+                (tour, event_id, int(event_year), int(simulation_version)),
+            ).fetchone()
+            previous_run_id = str(previous_row["run_id"]) if previous_row is not None else None
+
+            lookup_run_ids = [normalized_run_id]
+            if first_run_id and first_run_id not in lookup_run_ids:
+                lookup_run_ids.append(first_run_id)
+            if previous_run_id and previous_run_id not in lookup_run_ids:
+                lookup_run_ids.append(previous_run_id)
+
+            placeholders = ", ".join(["?"] * len(lookup_run_ids))
+            player_rows = conn.execute(
+                f"""
+                SELECT run_id, player_key, player_id, player_name, win_prob
+                FROM simulation_players
+                WHERE run_id IN ({placeholders})
+                """,
+                lookup_run_ids,
+            ).fetchall()
+
+        by_run: dict[str, dict[str, dict[str, Any]]] = {}
+        for row in player_rows:
+            row_run_id = str(row["run_id"])
+            by_run.setdefault(row_run_id, {})[str(row["player_key"])] = {
+                "player_id": row["player_id"],
+                "player_name": row["player_name"],
+                "win_probability": float(row["win_prob"]),
+            }
+
+        current_players = by_run.get(normalized_run_id, {})
+        first_players = by_run.get(first_run_id, {})
+        previous_players = by_run.get(previous_run_id, {}) if previous_run_id else {}
+
+        output: list[dict[str, Any]] = []
+        for player_key, current_row in current_players.items():
+            current_win = float(current_row["win_probability"])
+            first_row_for_player = first_players.get(player_key)
+            previous_row_for_player = previous_players.get(player_key)
+
+            delta_start = None
+            if first_row_for_player is not None:
+                delta_start = current_win - float(first_row_for_player["win_probability"])
+            elif first_run_id == normalized_run_id:
+                delta_start = 0.0
+
+            delta_prev = None
+            if previous_row_for_player is not None:
+                delta_prev = current_win - float(previous_row_for_player["win_probability"])
+            elif previous_run_id is None:
+                delta_prev = 0.0
+
+            output.append(
+                {
+                    "player_key": player_key,
+                    "player_id": current_row.get("player_id"),
+                    "player_name": current_row.get("player_name"),
+                    "delta_win_since_first": float(delta_start) if delta_start is not None else None,
+                    "delta_win_since_previous": float(delta_prev) if delta_prev is not None else None,
+                }
+            )
+
+        return output
+
     def list_event_lifecycle(
         self,
         *,

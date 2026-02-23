@@ -776,7 +776,7 @@ class SimulationService:
                 )
             else:
                 response.in_play_conditioning_note = warning_note
-        recorded_version = self._record_learning_prediction(
+        recorded_run_id, recorded_version = self._record_learning_prediction(
             request=request,
             response=response,
             players=players,
@@ -789,6 +789,10 @@ class SimulationService:
         )
         if recorded_version > 0:
             response.simulation_version = recorded_version
+        self._apply_win_deltas_from_learning(
+            run_id=recorded_run_id,
+            rows=response.players,
+        )
         return response
 
     async def get_learning_status(self, tour: str = "pga") -> LearningStatusResponse:
@@ -933,6 +937,11 @@ class SimulationService:
                     hole_scores=(live_record.hole_scores if live_record else []),
                 )
             )
+
+        self._apply_win_deltas_from_learning(
+            run_id=_to_str(latest.get("run_id")),
+            rows=result_rows,
+        )
 
         snapshot_generated_at = latest.get("created_at")
         generated_at = (
@@ -2021,9 +2030,9 @@ class SimulationService:
         raw_top_10_probability: np.ndarray,
         event_date: str | None,
         in_play_applied: bool,
-    ) -> int:
+    ) -> tuple[str, int]:
         if self._learning is None:
-            return 0
+            return "", 0
         try:
             player_rows: list[dict[str, Any]] = []
             for idx, record in enumerate(players):
@@ -2037,7 +2046,7 @@ class SimulationService:
                         "top_10_probability": float(raw_top_10_probability[idx]),
                     }
                 )
-            _, logged_version = self._learning.record_prediction(
+            logged_run_id, logged_version = self._learning.record_prediction(
                 tour=response.tour,
                 event_id=response.event_id,
                 event_name=response.event_name,
@@ -2052,10 +2061,51 @@ class SimulationService:
                 ),
                 players=player_rows,
             )
-            return int(logged_version)
+            return str(logged_run_id), int(logged_version)
         except Exception:
             # Never block simulation responses on local learning persistence.
-            return 0
+            return "", 0
+
+    def _apply_win_deltas_from_learning(
+        self,
+        *,
+        run_id: str | None,
+        rows: list[PlayerSimulationOutput],
+    ) -> None:
+        if self._learning is None:
+            return
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id or not rows:
+            return
+
+        try:
+            delta_rows = self._learning.get_run_player_win_deltas(run_id=normalized_run_id)
+        except Exception:
+            return
+        if not delta_rows:
+            return
+
+        delta_by_lookup: dict[str, dict[str, Any]] = {}
+        for delta_row in delta_rows:
+            id_lookup = _snapshot_player_lookup_key(delta_row.get("player_id"), None)
+            name_lookup = _snapshot_player_lookup_key(None, delta_row.get("player_name"))
+            if id_lookup:
+                delta_by_lookup[id_lookup] = delta_row
+            if name_lookup and name_lookup not in delta_by_lookup:
+                delta_by_lookup[name_lookup] = delta_row
+
+        for row in rows:
+            id_lookup = _snapshot_player_lookup_key(row.player_id, None)
+            name_lookup = _snapshot_player_lookup_key(None, row.player_name)
+            match = None
+            if id_lookup:
+                match = delta_by_lookup.get(id_lookup)
+            if match is None and name_lookup:
+                match = delta_by_lookup.get(name_lookup)
+            if match is None:
+                continue
+            row.win_delta_prev = _to_float(match.get("delta_win_since_previous"))
+            row.win_delta_start = _to_float(match.get("delta_win_since_first"))
 
     def _merge_player_records(
         self,

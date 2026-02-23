@@ -354,6 +354,82 @@ def test_event_trends_returns_snapshot_deltas(tmp_path) -> None:
     assert alpha["delta_win_since_previous"] > 0
 
 
+def test_learning_store_get_run_player_win_deltas(tmp_path) -> None:
+    db_path = tmp_path / "learning_run_deltas.sqlite3"
+    store = LearningStore(str(db_path))
+
+    initial_players = [
+        {
+            "player_id": "8101",
+            "player_name": "Delta One",
+            "win_probability": 0.20,
+            "top_3_probability": 0.45,
+            "top_5_probability": 0.62,
+            "top_10_probability": 0.82,
+        },
+        {
+            "player_id": "8102",
+            "player_name": "Delta Two",
+            "win_probability": 0.12,
+            "top_3_probability": 0.33,
+            "top_5_probability": 0.49,
+            "top_10_probability": 0.71,
+        },
+    ]
+    latest_players = [
+        {
+            "player_id": "8101",
+            "player_name": "Delta One",
+            "win_probability": 0.25,
+            "top_3_probability": 0.50,
+            "top_5_probability": 0.66,
+            "top_10_probability": 0.85,
+        },
+        {
+            "player_id": "8102",
+            "player_name": "Delta Two",
+            "win_probability": 0.10,
+            "top_3_probability": 0.31,
+            "top_5_probability": 0.47,
+            "top_10_probability": 0.69,
+        },
+    ]
+
+    _, version_one = store.record_prediction(
+        tour="pga",
+        event_id="55",
+        event_name="Delta Open",
+        event_date="2026-03-01",
+        requested_simulations=10000,
+        simulations=10000,
+        enable_in_play=True,
+        in_play_applied=False,
+        players=initial_players,
+    )
+    assert version_one == 1
+    run_two, version_two = store.record_prediction(
+        tour="pga",
+        event_id="55",
+        event_name="Delta Open",
+        event_date="2026-03-01",
+        requested_simulations=10000,
+        simulations=10000,
+        enable_in_play=True,
+        in_play_applied=True,
+        players=latest_players,
+    )
+    assert version_two == 2
+
+    deltas = store.get_run_player_win_deltas(run_id=run_two)
+    assert len(deltas) == 2
+
+    by_player_id = {str(row["player_id"]): row for row in deltas}
+    assert np.isclose(by_player_id["8101"]["delta_win_since_first"], 0.05)
+    assert np.isclose(by_player_id["8101"]["delta_win_since_previous"], 0.05)
+    assert np.isclose(by_player_id["8102"]["delta_win_since_first"], -0.02)
+    assert np.isclose(by_player_id["8102"]["delta_win_since_previous"], -0.02)
+
+
 def test_simulation_version_resets_by_event_year(tmp_path) -> None:
     db_path = tmp_path / "learning_versions.sqlite3"
     store = LearningStore(str(db_path))

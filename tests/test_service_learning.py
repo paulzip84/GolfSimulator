@@ -303,6 +303,46 @@ def test_service_logs_predictions_and_retrains_learning(tmp_path) -> None:
     assert len(trends.players) > 0
 
 
+def test_service_simulation_response_includes_win_delta_fields(tmp_path) -> None:
+    learning_store = LearningStore(str(tmp_path / "service_learning_win_deltas.sqlite3"))
+    service = SimulationService(
+        _LearningClient(),
+        learning_store=learning_store,
+        lifecycle_target_year=2025,
+    )
+
+    first = asyncio.run(
+        service.simulate(
+            SimulationRequest(
+                tour="pga",
+                simulations=4000,
+                seed=101,
+                enable_in_play_conditioning=False,
+                enable_seasonal_form=False,
+            )
+        )
+    )
+    assert len(first.players) >= 8
+    assert all(player.win_delta_prev == 0.0 for player in first.players)
+    assert all(player.win_delta_start == 0.0 for player in first.players)
+
+    second = asyncio.run(
+        service.simulate(
+            SimulationRequest(
+                tour="pga",
+                simulations=4000,
+                seed=202,
+                enable_in_play_conditioning=False,
+                enable_seasonal_form=False,
+            )
+        )
+    )
+    assert len(second.players) >= 8
+    assert all(player.win_delta_prev is not None for player in second.players)
+    assert all(player.win_delta_start is not None for player in second.players)
+    assert any(abs(float(player.win_delta_prev or 0.0)) > 1e-9 for player in second.players)
+
+
 def test_service_sync_uses_provisional_outcomes_when_official_feed_lags(tmp_path) -> None:
     learning_store = LearningStore(str(tmp_path / "service_learning_fallback.sqlite3"))
     service = SimulationService(

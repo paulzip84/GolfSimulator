@@ -60,6 +60,8 @@ class PlayerSimulationOutput(BaseModel):
     current_score_to_par: Optional[float] = None
     current_thru: Optional[str] = None
     today_score_to_par: Optional[float] = None
+    win_delta_prev: Optional[float] = None
+    win_delta_start: Optional[float] = None
     round_scores: list[float] = Field(default_factory=list)
     hole_scores: list[int] = Field(default_factory=list)
 

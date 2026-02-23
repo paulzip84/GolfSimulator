@@ -476,6 +476,30 @@ function trendForPlayer(player) {
   return null;
 }
 
+function numericOrNull(raw) {
+  const numeric = Number(raw);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+  return numeric;
+}
+
+function winDeltaPrevForPlayer(player, trend) {
+  const playerDelta = numericOrNull(player.win_delta_prev);
+  if (playerDelta != null) {
+    return playerDelta;
+  }
+  return numericOrNull(trend ? trend.delta_win_since_previous : null);
+}
+
+function winDeltaStartForPlayer(player, trend) {
+  const playerDelta = numericOrNull(player.win_delta_start);
+  if (playerDelta != null) {
+    return playerDelta;
+  }
+  return numericOrNull(trend ? trend.delta_win_since_first : null);
+}
+
 function createWinTrendSparkline(points) {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 360 88");
@@ -1480,19 +1504,21 @@ function renderTable(players) {
     appendResultCell(tr, "current_thru", formatThru(player.current_thru), false);
     appendResultCell(tr, "win_probability", formatPct(player.win_probability), true);
     const trend = trendForPlayer(player);
+    const deltaPrev = winDeltaPrevForPlayer(player, trend);
+    const deltaStart = winDeltaStartForPlayer(player, trend);
     appendResultCell(
       tr,
       "win_delta_prev",
-      formatSignedPct(trend ? trend.delta_win_since_previous : null),
+      formatSignedPct(deltaPrev),
       true,
-      deltaClassName(trend ? trend.delta_win_since_previous : null)
+      deltaClassName(deltaPrev)
     );
     appendResultCell(
       tr,
       "win_delta_start",
-      formatSignedPct(trend ? trend.delta_win_since_first : null),
+      formatSignedPct(deltaStart),
       true,
-      deltaClassName(trend ? trend.delta_win_since_first : null)
+      deltaClassName(deltaStart)
     );
     appendResultCell(tr, "top_3_probability", formatPct(player.top_3_probability), true);
     appendResultCell(tr, "top_5_probability", formatPct(player.top_5_probability), true);
