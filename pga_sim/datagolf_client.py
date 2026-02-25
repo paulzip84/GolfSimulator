@@ -67,9 +67,139 @@ class DataGolfClient:
         aliases = {
             "dpwt": "euro",
             "european": "euro",
-            "liv": "alt",
         }
         return aliases.get(normalized, normalized)
+
+    def _tour_candidates(self, tour: str) -> list[str]:
+        raw = str(tour or "").strip().lower()
+        normalized = self._normalize_tour(raw)
+        if normalized in {"liv", "alt"}:
+            if raw == "alt":
+                return ["alt", "liv"]
+            return ["liv", "alt"]
+        return [normalized]
+
+    @staticmethod
+    def _normalize_tour_code(value: Any) -> str | None:
+        if value is None:
+            return None
+        text = " ".join(str(value).strip().lower().split())
+        if not text:
+            return None
+        compact = text.replace("-", "").replace("_", "").replace(" ", "")
+        if compact in {"pga", "pgatour"}:
+            return "pga"
+        if compact in {"liv", "livgolf", "alt"}:
+            return "liv"
+        if compact in {"euro", "dpwt", "dpworldtour", "european", "europeantour"}:
+            return "euro"
+        if compact in {"kft", "kornferry", "kornferrytour"}:
+            return "kft"
+        if "pga" in text:
+            return "pga"
+        if "liv" in text:
+            return "liv"
+        if ("dp" in text and "world" in text) or "european" in text:
+            return "euro"
+        if "korn" in text and "ferry" in text:
+            return "kft"
+        return compact
+
+    @staticmethod
+    def _extract_schedule_rows(payload: Any) -> list[Mapping[str, Any]]:
+        if isinstance(payload, list):
+            return [row for row in payload if isinstance(row, Mapping)]
+        if not isinstance(payload, Mapping):
+            return []
+        candidates = (
+            payload.get("schedule"),
+            payload.get("event"),
+            payload.get("events"),
+        )
+        for candidate in candidates:
+            if isinstance(candidate, list):
+                return [row for row in candidate if isinstance(row, Mapping)]
+        return []
+
+    @staticmethod
+    def _payload_tour_codes(payload: Any) -> set[str]:
+        values: set[str] = set()
+        if isinstance(payload, Mapping):
+            for key in ("tour", "tour_name", "tour_code", "tour_nm"):
+                normalized = DataGolfClient._normalize_tour_code(payload.get(key))
+                if normalized:
+                    values.add(normalized)
+            for nested_key in ("event", "tournament", "meta", "metadata"):
+                nested = payload.get(nested_key)
+                if isinstance(nested, Mapping):
+                    for key in ("tour", "tour_name", "tour_code", "tour_nm"):
+                        normalized = DataGolfClient._normalize_tour_code(nested.get(key))
+                        if normalized:
+                            values.add(normalized)
+        return values
+
+    def _payload_tour_match_status(self, path: str, payload: Any, tour_code: str) -> str:
+        # Returns "match", "mismatch", or "unknown".
+        requested = self._normalize_tour_code(tour_code)
+        if not requested:
+            return "unknown"
+
+        path_key = str(path).strip().lower()
+        if "get-schedule" in path_key:
+            rows = self._extract_schedule_rows(payload)
+            row_tours: set[str] = set()
+            for row in rows:
+                for key in ("tour", "tour_name", "tour_code", "tour_nm"):
+                    normalized = self._normalize_tour_code(row.get(key))
+                    if normalized:
+                        row_tours.add(normalized)
+                        break
+            if not row_tours:
+                return "unknown"
+            return "match" if requested in row_tours else "mismatch"
+
+        payload_tours = self._payload_tour_codes(payload)
+        if not payload_tours:
+            return "unknown"
+        return "match" if requested in payload_tours else "mismatch"
+
+    async def _get_json_for_tour(
+        self,
+        path: str,
+        *,
+        tour: str,
+        params: Mapping[str, Any] | None = None,
+    ) -> Any:
+        candidates = self._tour_candidates(tour)
+        last_error: DataGolfAPIError | None = None
+        fallback_payload: Any | None = None
+        saw_mismatch = False
+        extra_params = dict(params or {})
+        for tour_code in candidates:
+            query = dict(extra_params)
+            query["tour"] = tour_code
+            try:
+                payload = await self._get_json(path, params=query)
+            except DataGolfAPIError as exc:
+                last_error = exc
+                continue
+            match_status = self._payload_tour_match_status(path=path, payload=payload, tour_code=tour_code)
+            if match_status == "match":
+                return payload
+            if match_status == "unknown" and fallback_payload is None:
+                fallback_payload = payload
+                continue
+            saw_mismatch = True
+            continue
+        if fallback_payload is not None:
+            return fallback_payload
+        if last_error is not None:
+            raise last_error
+        if saw_mismatch:
+            raise DataGolfAPIError(
+                f"DataGolf returned payload for unexpected tour for {path}"
+            )
+        raise DataGolfAPIError(f"Unable to resolve tour for {path}.")
 
     async def get_schedule(
         self,
@@ -77,17 +207,16 @@ class DataGolfClient:
         upcoming_only: str = "yes",
         season: int | None = None,
     ) -> Any:
-        tour_code = self._normalize_tour(tour)
-        return await self._get_json(
+        return await self._get_json_for_tour(
             "get-schedule",
-            params={"tour": tour_code, "upcoming_only": upcoming_only, "season": season},
+            tour=tour,
+            params={"upcoming_only": upcoming_only, "season": season},
         )
 
     async def get_field_updates(self, tour: str = "pga", event_id: str | None = None) -> Any:
-        tour_code = self._normalize_tour(tour)
         # Current-week field feed is keyed by tour. `event_id` is accepted in method
         # signature to keep a stable interface but is not sent.
-        return await self._get_json("field-updates", params={"tour": tour_code})
+        return await self._get_json_for_tour("field-updates", tour=tour)
 
     async def get_pre_tournament(
         self,
@@ -96,12 +225,11 @@ class DataGolfClient:
         add_position: int = 3,
         odds_format: str = "percent",
     ) -> Any:
-        tour_code = self._normalize_tour(tour)
         # Current-week pre-tournament feed is keyed by tour only.
-        return await self._get_json(
+        return await self._get_json_for_tour(
             "preds/pre-tournament",
+            tour=tour,
             params={
-                "tour": tour_code,
                 "add_position": add_position,
                 "odds_format": odds_format,
             },
@@ -110,9 +238,8 @@ class DataGolfClient:
     async def get_player_decompositions(
         self, tour: str = "pga", event_id: str | None = None
     ) -> Any:
-        tour_code = self._normalize_tour(tour)
         # Current-week decomposition feed is keyed by tour only.
-        return await self._get_json("preds/player-decompositions", params={"tour": tour_code})
+        return await self._get_json_for_tour("preds/player-decompositions", tour=tour)
 
     async def get_in_play(
         self,
@@ -120,19 +247,20 @@ class DataGolfClient:
         dead_heat: str = "no",
         odds_format: str = "percent",
     ) -> Any:
-        tour_code = self._normalize_tour(tour)
-        return await self._get_json(
+        return await self._get_json_for_tour(
             "preds/in-play",
+            tour=tour,
             params={
-                "tour": tour_code,
                 "dead_heat": dead_heat,
                 "odds_format": odds_format,
             },
         )
 
     async def get_historical_event_list(self, tour: str = "pga") -> Any:
-        tour_code = self._normalize_tour(tour)
-        return await self._get_json("historical-event-data/event-list", params={"tour": tour_code})
+        return await self._get_json_for_tour(
+            "historical-event-data/event-list",
+            tour=tour,
+        )
 
     async def get_historical_event(
         self,
@@ -140,11 +268,10 @@ class DataGolfClient:
         event_id: str,
         year: int,
     ) -> Any:
-        tour_code = self._normalize_tour(tour)
-        return await self._get_json(
+        return await self._get_json_for_tour(
             "historical-event-data/events",
+            tour=tour,
             params={
-                "tour": tour_code,
                 "event_id": event_id,
                 "year": year,
             },

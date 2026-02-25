@@ -232,6 +232,34 @@ class _SchedulePlaceholderLifecycleClient(_ScheduledLifecycleClient):
         ]
 
 
+class _NoActiveFieldLifecycleClient(_ScheduledLifecycleClient):
+    async def get_field_updates(self, tour: str = "pga", event_id: Optional[str] = None):
+        raise DataGolfAPIError("DataGolf API error for field-updates: no alt event this week.")
+
+    async def get_schedule(
+        self,
+        tour: str = "pga",
+        upcoming_only: str = "yes",
+        season: int | None = None,
+    ):
+        return [
+            {
+                "calendar_year": 2026,
+                "date": "2026-01-20",
+                "event_id": "719",
+                "event_name": "Hong Kong",
+                "tour": "liv",
+            },
+            {
+                "calendar_year": 2026,
+                "date": "2026-03-12",
+                "event_id": "713",
+                "event_name": "Singapore",
+                "tour": "liv",
+            },
+        ]
+
+
 def test_lifecycle_cycle_captures_pre_event_snapshot_once(tmp_path) -> None:
     learning_store = LearningStore(str(tmp_path / "lifecycle_pre_event.sqlite3"))
     service = SimulationService(
@@ -397,6 +425,44 @@ def test_lifecycle_status_includes_completed_schedule_placeholder(tmp_path) -> N
     ]
     assert len(schedule_rows) == 1
     assert schedule_rows[0].state == "complete"
+
+
+def test_lifecycle_status_handles_missing_active_field_feed_without_error(tmp_path) -> None:
+    learning_store = LearningStore(str(tmp_path / "lifecycle_no_active_field.sqlite3"))
+    service = SimulationService(
+        _NoActiveFieldLifecycleClient(),
+        learning_store=learning_store,
+        lifecycle_pre_event_simulations=5000,
+        lifecycle_pre_event_seed=42,
+        lifecycle_sync_max_events=5,
+        lifecycle_target_year=2026,
+    )
+
+    status = asyncio.run(service.get_lifecycle_status("liv"))
+    assert status.tour == "liv"
+    assert status.active_event_id is None
+    row_ids = {row.event_id for row in status.recent_events}
+    assert "719" in row_ids
+
+
+def test_lifecycle_last_run_note_scoped_per_tour(tmp_path) -> None:
+    learning_store = LearningStore(str(tmp_path / "lifecycle_last_run_scope.sqlite3"))
+    service = SimulationService(
+        _ScheduledLifecycleClient(),
+        learning_store=learning_store,
+        lifecycle_pre_event_simulations=5000,
+        lifecycle_pre_event_seed=42,
+        lifecycle_sync_max_events=5,
+        lifecycle_target_year=2026,
+    )
+
+    pga_status = asyncio.run(service.run_lifecycle_cycle("pga"))
+    assert pga_status.last_run_note is not None
+    assert pga_status.last_run_at is not None
+
+    liv_status = asyncio.run(service.get_lifecycle_status("liv"))
+    assert liv_status.last_run_note is None
+    assert liv_status.last_run_at is None
 
 
 def test_lifecycle_cycle_forces_retrain_when_calibration_health_degrades(tmp_path) -> None:

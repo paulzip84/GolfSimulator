@@ -100,6 +100,83 @@ h1 {
   padding: 22px;
 }
 
+.tour-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.tour-tab {
+  border: 1px solid #cfbea5;
+  border-radius: 999px;
+  background: #fff7ea;
+  color: #4f3a1c;
+  font: inherit;
+  font-weight: 700;
+  padding: 7px 10px 7px 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  transition: transform 120ms ease, filter 120ms ease, border-color 120ms ease;
+}
+
+.tour-tab:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.03);
+}
+
+.tour-tab.is-active {
+  border-color: #0d6f66;
+  background: linear-gradient(120deg, #0a6a61, #0d8378);
+  color: #f2fbfa;
+}
+
+.tour-tab-badge {
+  border: 1px solid #cabca4;
+  border-radius: 999px;
+  background: #fffefb;
+  color: #4e5b66;
+  padding: 2px 8px;
+  font-size: 0.72rem;
+  font-family: "IBM Plex Mono", monospace;
+  letter-spacing: 0.01em;
+}
+
+.tour-tab.is-active .tour-tab-badge {
+  border-color: #c4e3df;
+  background: #f7fffe;
+}
+
+.tour-tab-badge.state-idle {
+  color: #5c6671;
+}
+
+.tour-tab-badge.state-queued {
+  color: #775211;
+  border-color: #e0bd83;
+  background: #fff8eb;
+}
+
+.tour-tab-badge.state-running {
+  color: #0c6a5f;
+  border-color: #9fd3cb;
+  background: #eefaf8;
+}
+
+.tour-tab-badge.state-complete {
+  color: #0e5f37;
+  border-color: #9fcdb5;
+  background: #eefaf2;
+}
+
+.tour-tab-badge.state-failed {
+  color: #8d2119;
+  border-color: #e3aaa3;
+  background: #fff2ef;
+}
+
 .field-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

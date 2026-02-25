@@ -26,6 +26,25 @@
       </header>
 
       <section class="card controls automation-focused" aria-label="Simulation controls">
+        <div id="tourTabs" class="tour-tabs" role="tablist" aria-label="Tour selector tabs">
+          <button type="button" class="tour-tab is-active" data-tour="pga" role="tab" aria-selected="true">
+            PGA
+            <span class="tour-tab-badge" data-tour-badge="pga">idle</span>
+          </button>
+          <button type="button" class="tour-tab" data-tour="liv" role="tab" aria-selected="false">
+            LIV
+            <span class="tour-tab-badge" data-tour-badge="liv">idle</span>
+          </button>
+          <button type="button" class="tour-tab" data-tour="euro" role="tab" aria-selected="false">
+            DP
+            <span class="tour-tab-badge" data-tour-badge="euro">idle</span>
+          </button>
+          <button type="button" class="tour-tab" data-tour="kft" role="tab" aria-selected="false">
+            Korn Ferry
+            <span class="tour-tab-badge" data-tour-badge="kft">idle</span>
+          </button>
+        </div>
+
         <div class="field-grid">
           <label class="field">
             <span>Tour</span>

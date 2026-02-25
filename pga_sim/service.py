@@ -233,8 +233,8 @@ class SimulationService:
             lifecycle_target_year if lifecycle_target_year is not None else datetime.now(timezone.utc).year
         )
         self._lifecycle_lock: asyncio.Lock | None = None
-        self._last_lifecycle_run_at: datetime | None = None
-        self._last_lifecycle_run_note: str | None = None
+        self._last_lifecycle_run_at_by_tour: dict[str, datetime] = {}
+        self._last_lifecycle_run_note_by_tour: dict[str, str] = {}
 
     def _memory_safe_batch_cap(self, *, player_count: int) -> int:
         # cdf_rows in the simulator is the dominant allocation: chunk * players * deltas * float64.
@@ -395,11 +395,14 @@ class SimulationService:
     async def list_upcoming_events(self, tour: str = "pga", limit: int = 12) -> list[EventSummary]:
         schedule_payload = await self._datagolf.get_schedule(tour=tour)
         rows = _extract_rows(schedule_payload, ("schedule", "event"))
+        requested_tour_codes = _requested_tour_code_set(tour)
+        requested_primary_tour = _normalize_tour_code(tour) or "pga"
 
         active_event_id: str | None = None
         active_event_name: str | None = None
         active_event_date: str | None = None
         active_event_course: str | None = None
+        active_event_tour_code: str | None = None
         try:
             field_payload = await self._datagolf.get_field_updates(tour=tour)
             active_event_id = _normalized_event_id(
@@ -408,11 +411,26 @@ class SimulationService:
             active_event_name = _string_from_payload(field_payload, _EVENT_NAME_KEYS)
             active_event_date = _string_from_payload(field_payload, _DATE_KEYS)
             active_event_course = _string_from_payload(field_payload, _COURSE_KEYS)
+            active_event_tour_code = _normalize_tour_code(
+                _string_from_payload(
+                    field_payload,
+                    ("tour", "tour_name", "tour_code", "tour_nm"),
+                )
+            )
         except DataGolfAPIError:
             pass
 
         events: list[EventSummary] = []
+        schedule_includes_tour_metadata = False
         for row in rows:
+            row_tour_code = _normalize_tour_code(
+                _string_from_keys(row, ("tour", "tour_name", "tour_code", "tour_nm"))
+            )
+            if row_tour_code:
+                schedule_includes_tour_metadata = True
+                if row_tour_code not in requested_tour_codes:
+                    continue
+
             event_id = _string_from_keys(row, _EVENT_ID_KEYS)
             event_name = _string_from_keys(row, _EVENT_NAME_KEYS)
             if not event_id or not event_name:
@@ -435,24 +453,79 @@ class SimulationService:
                 )
             )
 
+        # If a non-PGA schedule feed does not identify tour per row, it can bleed in PGA events.
+        # In that case, rely on field-updates active event only.
+        if requested_primary_tour != "pga" and not schedule_includes_tour_metadata:
+            events = []
+
+        predictive_event_id: str | None = None
+        predictive_event_name: str | None = None
+        if not active_event_id:
+            aux_results = await asyncio.gather(
+                self._datagolf.get_pre_tournament(
+                    tour=tour,
+                    event_id=None,
+                    add_position=3,
+                    odds_format="percent",
+                ),
+                self._datagolf.get_player_decompositions(
+                    tour=tour,
+                    event_id=None,
+                ),
+                return_exceptions=True,
+            )
+            for payload in aux_results:
+                if isinstance(payload, Exception):
+                    continue
+                if predictive_event_id is None:
+                    predictive_event_id = _normalized_event_id(
+                        _string_from_payload(payload, _EVENT_ID_KEYS)
+                    )
+                if predictive_event_name is None:
+                    predictive_event_name = _string_from_payload(payload, _EVENT_NAME_KEYS)
+
         active_already_listed = any(
             _normalized_event_id(event.event_id) == active_event_id for event in events
         )
+        active_event_tour_mismatch = bool(
+            active_event_tour_code
+            and active_event_tour_code not in requested_tour_codes
+        )
         if active_event_id and not active_already_listed:
-            events.append(
-                EventSummary(
-                    event_id=active_event_id,
-                    event_name=active_event_name or "Active Tour Event",
-                    start_date=active_event_date,
-                    course=active_event_course,
-                    simulatable=True,
-                    unavailable_reason=None,
+            if not active_event_tour_mismatch:
+                events.append(
+                    EventSummary(
+                        event_id=active_event_id,
+                        event_name=active_event_name or "Active Tour Event",
+                        start_date=active_event_date,
+                        course=active_event_course,
+                        simulatable=True,
+                        unavailable_reason=None,
+                    )
                 )
-            )
 
         if not active_event_id and events:
-            events[0].simulatable = True
-            events[0].unavailable_reason = None
+            matched_index: int | None = None
+            if predictive_event_id is not None:
+                for idx, event in enumerate(events):
+                    if _normalized_event_id(event.event_id) == predictive_event_id:
+                        matched_index = idx
+                        break
+            if matched_index is None and predictive_event_name:
+                for idx, event in enumerate(events):
+                    if _event_names_compatible(event.event_name, predictive_event_name):
+                        matched_index = idx
+                        break
+
+            for idx, event in enumerate(events):
+                if matched_index is not None and idx == matched_index:
+                    event.simulatable = True
+                    event.unavailable_reason = None
+                else:
+                    event.simulatable = False
+                    event.unavailable_reason = (
+                        "DataGolf current-week prediction feed has not rolled to this event yet."
+                    )
 
         events.sort(key=lambda e: (not e.simulatable, _safe_date_sort_key(e.start_date)))
         return events[:limit]
@@ -520,11 +593,70 @@ class SimulationService:
                 live_payload = {}
 
         selected_event_id = _normalized_event_id(request.event_id)
+        selected_event_name: str | None = None
+        if selected_event_id:
+            get_schedule = getattr(self._datagolf, "get_schedule", None)
+            if callable(get_schedule):
+                schedule_payload: Any | None = None
+                try:
+                    schedule_payload = await get_schedule(
+                        tour=request.tour,
+                        upcoming_only="no",
+                    )
+                except TypeError:
+                    try:
+                        schedule_payload = await get_schedule(tour=request.tour)
+                    except Exception:
+                        schedule_payload = None
+                except DataGolfAPIError:
+                    schedule_payload = None
+
+                if schedule_payload is not None:
+                    schedule_rows = _extract_rows(schedule_payload, ("schedule", "event"))
+                    for row in schedule_rows:
+                        row_event_id = _normalized_event_id(
+                            _string_from_keys(row, _EVENT_ID_KEYS)
+                        )
+                        if row_event_id == selected_event_id:
+                            selected_event_name = _string_from_keys(row, _EVENT_NAME_KEYS)
+                            break
+
         active_event_id = _normalized_event_id(_string_from_payload(field_payload, _EVENT_ID_KEYS))
+        feed_event_ids: set[str] = set()
+        for payload in (field_payload, pre_payload, decomp_payload, live_payload):
+            feed_event_id = _normalized_event_id(_string_from_payload(payload, _EVENT_ID_KEYS))
+            if feed_event_id:
+                feed_event_ids.add(feed_event_id)
+        feed_event_name = (
+            _string_from_payload(field_payload, _EVENT_NAME_KEYS)
+            or _string_from_payload(pre_payload, _EVENT_NAME_KEYS)
+            or _string_from_payload(decomp_payload, _EVENT_NAME_KEYS)
+            or _string_from_payload(live_payload, _EVENT_NAME_KEYS)
+        )
         if selected_event_id and not active_event_id:
             data_feed_warnings.append(
                 "unable to validate selected event against active field feed"
             )
+            if feed_event_ids and selected_event_id not in feed_event_ids:
+                known_feed_ids = ", ".join(sorted(feed_event_ids)[:3])
+                selected_label = selected_event_name or request.event_id or selected_event_id
+                raise ValueError(
+                    "Selected event is not yet available in DataGolf current-week prediction "
+                    "feeds for this tour. "
+                    f"Selected: {selected_label} (event_id={selected_event_id}). "
+                    f"Feed currently reports event_id={known_feed_ids}."
+                )
+            if (
+                selected_event_name
+                and feed_event_name
+                and not _event_names_compatible(selected_event_name, feed_event_name)
+            ):
+                raise ValueError(
+                    "Selected event is not yet available in DataGolf current-week prediction "
+                    "feeds for this tour. "
+                    f"Selected: {selected_event_name} (event_id={selected_event_id}). "
+                    f"Feed currently reports event: {feed_event_name}."
+                )
         if selected_event_id and active_event_id and selected_event_id != active_event_id:
             active_event_name = _string_from_payload(field_payload, _EVENT_NAME_KEYS) or "Unknown"
             raise ValueError(
@@ -685,7 +817,8 @@ class SimulationService:
             or _string_from_payload(pre_payload, _EVENT_ID_KEYS)
         )
         event_name = (
-            _string_from_payload(field_payload, _EVENT_NAME_KEYS)
+            selected_event_name
+            or _string_from_payload(field_payload, _EVENT_NAME_KEYS)
             or _string_from_payload(pre_payload, _EVENT_NAME_KEYS)
         )
 
@@ -1074,16 +1207,25 @@ class SimulationService:
     async def get_lifecycle_status(self, tour: str = "pga") -> LifecycleStatusResponse:
         normalized_tour = (tour or "pga").strip().lower()
         generated_at = datetime.now(timezone.utc)
+        last_run_at = self._last_lifecycle_run_at_by_tour.get(normalized_tour)
+        last_run_note = self._last_lifecycle_run_note_by_tour.get(normalized_tour)
         if self._learning is None:
             return LifecycleStatusResponse(
                 generated_at=generated_at,
                 tour=normalized_tour,
                 automation_enabled=self._lifecycle_automation_enabled,
-                last_run_at=self._last_lifecycle_run_at,
-                last_run_note=self._last_lifecycle_run_note,
+                last_run_at=last_run_at,
+                last_run_note=last_run_note,
             )
 
-        active_context = await self._get_active_event_context(normalized_tour)
+        active_context: dict[str, Any] | None = None
+        try:
+            active_context = await self._get_active_event_context(normalized_tour)
+        except DataGolfAPIError:
+            # Some tours can have schedule data available while current-week field feed
+            # is unavailable (e.g., no active event this week). Lifecycle status should
+            # still render instead of hard-failing.
+            active_context = None
         recent_rows = self._learning.list_event_lifecycle(
             tour=normalized_tour,
             max_events=24,
@@ -1238,8 +1380,8 @@ class SimulationService:
             pre_event_snapshot_ready=pre_event_snapshot_ready,
             pre_event_snapshot_version=pre_event_snapshot_version,
             pending_events=pending_count,
-            last_run_at=self._last_lifecycle_run_at,
-            last_run_note=self._last_lifecycle_run_note,
+            last_run_at=last_run_at,
+            last_run_note=last_run_note,
             recent_events=[LifecycleEventStatus(**row) for row in filtered_rows[:24]],
         )
 
@@ -1427,8 +1569,8 @@ class SimulationService:
             else:
                 note_parts.append("No pending events for sync/retrain.")
 
-            self._last_lifecycle_run_at = datetime.now(timezone.utc)
-            self._last_lifecycle_run_note = " ".join(note_parts).strip()
+            self._last_lifecycle_run_at_by_tour[normalized_tour] = datetime.now(timezone.utc)
+            self._last_lifecycle_run_note_by_tour[normalized_tour] = " ".join(note_parts).strip()
 
         return await self.get_lifecycle_status(normalized_tour)
 
@@ -2974,6 +3116,79 @@ def _normalized_event_id(event_id: str | None) -> str | None:
         return None
     normalized = "".join(event_id.strip().lower().split())
     return normalized or None
+
+
+def _normalized_event_name(value: str | None) -> str:
+    if value is None:
+        return ""
+    text = re.sub(r"[^a-z0-9]+", " ", str(value).strip().lower())
+    return " ".join(text.split())
+
+
+def _event_names_compatible(selected_name: str | None, feed_name: str | None) -> bool:
+    selected = _normalized_event_name(selected_name)
+    feed = _normalized_event_name(feed_name)
+    if not selected or not feed:
+        return True
+    if selected in feed or feed in selected:
+        return True
+
+    stopwords = {
+        "the",
+        "championship",
+        "classic",
+        "open",
+        "invitational",
+        "tournament",
+        "tour",
+        "presented",
+        "by",
+        "liv",
+        "golf",
+        "event",
+    }
+    selected_tokens = {token for token in selected.split() if token and token not in stopwords}
+    feed_tokens = {token for token in feed.split() if token and token not in stopwords}
+    if not selected_tokens or not feed_tokens:
+        return True
+    return bool(selected_tokens & feed_tokens)
+
+
+def _normalize_tour_code(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = " ".join(str(value).strip().lower().split())
+    if not text:
+        return None
+
+    compact = text.replace("-", "").replace("_", "").replace(" ", "")
+    if compact in {"pga", "pgatour"}:
+        return "pga"
+    if compact in {"liv", "livgolf", "alt"}:
+        return "liv"
+    if compact in {"euro", "dpwt", "dpworldtour", "european", "europeantour"}:
+        return "euro"
+    if compact in {"kft", "kornferry", "kornferrytour"}:
+        return "kft"
+
+    if "pga" in text:
+        return "pga"
+    if "liv" in text:
+        return "liv"
+    if ("dp" in text and "world" in text) or "european" in text:
+        return "euro"
+    if "korn" in text and "ferry" in text:
+        return "kft"
+    return compact
+
+
+def _requested_tour_code_set(tour: str | None) -> set[str]:
+    normalized = _normalize_tour_code(tour)
+    if normalized == "liv":
+        return {"liv", "alt"}
+    if normalized:
+        return {normalized}
+    return {"pga"}
 
 
 def _season_from_row(row: dict[str, Any]) -> int | None:

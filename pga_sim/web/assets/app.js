@@ -1,3 +1,10 @@
+const SUPPORTED_TOURS = [
+  { value: "pga", label: "PGA" },
+  { value: "liv", label: "LIV" },
+  { value: "euro", label: "DP" },
+  { value: "kft", label: "Korn Ferry" },
+];
+
 const state = {
   events: [],
   latestResult: null,
@@ -11,6 +18,10 @@ const state = {
   lifecyclePollTimerId: null,
   liveScorePollTimerId: null,
   simulationInFlight: false,
+  currentSimulationTour: null,
+  simulationQueue: [],
+  tabSimulationStateByTour: {},
+  eventsRequestToken: 0,
 };
 const AUTOMATION_SIMULATION_INTERVAL_SECONDS = 120;
 const LIVE_SCORE_POLL_INTERVAL_SECONDS = 30;
@@ -219,6 +230,7 @@ const CONTROL_TOOLTIPS = {
 };
 
 const ui = {
+  tourTabs: document.getElementById("tourTabs"),
   tourSelect: document.getElementById("tourSelect"),
   eventSelect: document.getElementById("eventSelect"),
   simulationsInput: document.getElementById("simulationsInput"),
@@ -324,6 +336,93 @@ function setLifecycleStatus(message = "", running = false) {
   ui.lifecycleStatus.textContent = message;
   ui.lifecycleStatus.classList.toggle("running", running);
   ui.lifecycleStatus.classList.toggle("idle", !running);
+}
+
+function normalizedTourValue(value) {
+  const normalized = String(value || "pga").trim().toLowerCase();
+  if (SUPPORTED_TOURS.some((tour) => tour.value === normalized)) {
+    return normalized;
+  }
+  return "pga";
+}
+
+function getTabSimulationState(tour) {
+  const key = normalizedTourValue(tour);
+  if (!state.tabSimulationStateByTour[key]) {
+    state.tabSimulationStateByTour[key] = "idle";
+  }
+  return state.tabSimulationStateByTour[key];
+}
+
+function setTourTabSimulationState(tour, tabState) {
+  const key = normalizedTourValue(tour);
+  const allowedStates = new Set(["idle", "queued", "running", "complete", "failed"]);
+  state.tabSimulationStateByTour[key] = allowedStates.has(tabState) ? tabState : "idle";
+  renderTourTabs();
+}
+
+function renderTourTabs() {
+  if (!ui.tourTabs) {
+    return;
+  }
+  const activeTour = normalizedTourValue(ui.tourSelect?.value || "pga");
+  const buttons = ui.tourTabs.querySelectorAll(".tour-tab[data-tour]");
+  buttons.forEach((button) => {
+    const tour = normalizedTourValue(button.getAttribute("data-tour"));
+    const active = tour === activeTour;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+
+    const badge = button.querySelector("[data-tour-badge]");
+    if (!badge) {
+      return;
+    }
+    const tabState = getTabSimulationState(tour);
+    badge.textContent = tabState;
+    badge.className = `tour-tab-badge state-${tabState}`;
+  });
+}
+
+function queueSimulationRequest({ tour, eventId, fromAutoRefresh = false } = {}) {
+  const normalizedTour = normalizedTourValue(tour || ui.tourSelect?.value || "pga");
+  const normalizedEventId = String(eventId || "").trim();
+  const duplicate = state.simulationQueue.some(
+    (item) => item.tour === normalizedTour && item.eventId === normalizedEventId
+  );
+  if (!duplicate) {
+    state.simulationQueue.push({
+      tour: normalizedTour,
+      eventId: normalizedEventId,
+      fromAutoRefresh: Boolean(fromAutoRefresh),
+    });
+  }
+  setTourTabSimulationState(normalizedTour, "queued");
+}
+
+function shouldAutoSimulateForTour(tour) {
+  const tabState = getTabSimulationState(tour);
+  return tabState === "idle" || tabState === "failed";
+}
+
+function hasSimulatableEvents() {
+  return Array.isArray(state.events) && state.events.some((event) => event && event.simulatable);
+}
+
+function processNextQueuedSimulation() {
+  if (state.simulationInFlight || state.simulationQueue.length === 0) {
+    return;
+  }
+  const next = state.simulationQueue.shift();
+  if (!next) {
+    return;
+  }
+  const background = normalizedTourValue(next.tour) !== normalizedTourValue(ui.tourSelect?.value || "pga");
+  void runSimulation({
+    fromAutoRefresh: next.fromAutoRefresh,
+    targetTour: next.tour,
+    targetEventId: next.eventId,
+    background,
+  });
 }
 
 function setBusy(isBusy) {
@@ -942,13 +1041,20 @@ function updateEventSelect(events) {
 }
 
 async function loadEvents() {
+  const requestTour = normalizedTourValue(ui.tourSelect.value);
+  const requestToken = ++state.eventsRequestToken;
+  const isLatestRequest = () => requestToken === state.eventsRequestToken;
+
   setError();
   setFormStatus("");
   setBusy(true);
   setStatus("Loading upcoming events...", true);
   try {
-    const tour = encodeURIComponent(ui.tourSelect.value);
+    const tour = encodeURIComponent(requestTour);
     const response = await fetch(`/events/upcoming?tour=${tour}&limit=40`);
+    if (!isLatestRequest()) {
+      return;
+    }
     if (!response.ok) {
       let detail = `Unable to fetch events (${response.status})`;
       try {
@@ -962,17 +1068,27 @@ async function loadEvents() {
       throw new Error(detail);
     }
     const events = await response.json();
+    if (!isLatestRequest()) {
+      return;
+    }
     state.events = events;
     updateEventSelect(events);
     const simulatableCount = events.filter((event) => event.simulatable).length;
     setStatus(
-      `Loaded ${events.length} events (${simulatableCount} currently simulatable) for ${ui.tourSelect.value.toUpperCase()}.`
+      `Loaded ${events.length} events (${simulatableCount} currently simulatable) for ${requestTour.toUpperCase()}.`
     );
   } catch (error) {
+    if (!isLatestRequest()) {
+      return;
+    }
+    state.events = [];
+    updateEventSelect([]);
     setStatus("Unable to load events.");
     setError(error.message || "Unexpected error while fetching events.");
   } finally {
-    setBusy(false);
+    if (isLatestRequest()) {
+      setBusy(false);
+    }
   }
 }
 
@@ -1273,8 +1389,15 @@ async function refreshLiveScoresOnly({ silent = true } = {}) {
 }
 
 async function loadLatestSnapshotFromDb({ silent = true, runIfMissing = true } = {}) {
-  const tourValue = ui.tourSelect.value;
+  const tourValue = normalizedTourValue(ui.tourSelect.value);
   const selectedEventId = (ui.eventSelect?.value || "").trim();
+  if (!selectedEventId && !hasSimulatableEvents()) {
+    setTourTabSimulationState(tourValue, "idle");
+    setStatus(
+      `No simulatable event currently available for ${tourValue.toUpperCase()}. Waiting for DataGolf current-week feed update.`
+    );
+    return;
+  }
   const query = new URLSearchParams({ tour: tourValue });
   if (selectedEventId) {
     query.set("event_id", selectedEventId);
@@ -1296,12 +1419,25 @@ async function loadLatestSnapshotFromDb({ silent = true, runIfMissing = true } =
           `${detail} Running initial simulation...`,
           true
         );
-        await runSimulation(false);
+        await runSimulation({
+          fromAutoRefresh: false,
+          targetTour: tourValue,
+          targetEventId: selectedEventId,
+          background: false,
+        });
         return;
+      }
+      if (runIfMissing && state.simulationInFlight) {
+        queueSimulationRequest({
+          tour: tourValue,
+          eventId: selectedEventId,
+          fromAutoRefresh: false,
+        });
       }
       if (!silent) {
         setStatus(detail);
       }
+      setTourTabSimulationState(tourValue, "idle");
       return;
     }
     if (!response.ok) {
@@ -1321,15 +1457,29 @@ async function loadLatestSnapshotFromDb({ silent = true, runIfMissing = true } =
     const hydrationCheck = snapshotHydrationNeedsFreshSimulation(payload);
     if (hydrationCheck.needsRefresh && runIfMissing && !state.simulationInFlight) {
       setStatus(`${hydrationCheck.reason} Running refresh simulation...`, true);
-      await runSimulation(false);
+      await runSimulation({
+        fromAutoRefresh: false,
+        targetTour: tourValue,
+        targetEventId: selectedEventId,
+        background: false,
+      });
       return;
+    }
+    if (hydrationCheck.needsRefresh && runIfMissing && state.simulationInFlight) {
+      queueSimulationRequest({
+        tour: tourValue,
+        eventId: selectedEventId,
+        fromAutoRefresh: false,
+      });
     }
     renderResult(payload);
     await loadEventTrendsForCurrentEvent({ silent: true });
+    setTourTabSimulationState(tourValue, "complete");
     setStatus(
       `Loaded latest snapshot from DB: v${Number(payload.simulation_version || 1)} (${Number(payload.simulations || 0).toLocaleString()} sims).`
     );
   } catch (error) {
+    setTourTabSimulationState(tourValue, "failed");
     if (!silent) {
       setError(error.message || "Unexpected error while loading latest snapshot.");
     }
@@ -1398,7 +1548,7 @@ function startAutoSimulation() {
       setSimulationAutomationStatus(autoSimulationPausedMessage(), false);
       return;
     }
-    void runSimulation(true);
+    void runSimulation({ fromAutoRefresh: true });
   };
   window.setTimeout(runOnce, 3000);
   state.autoSimulationTimerId = window.setInterval(
@@ -1423,7 +1573,7 @@ function applyAutoRefreshSchedule() {
     if (!shouldAutoRunSimulationNow()) {
       return;
     }
-    void runSimulation(true);
+    void runSimulation({ fromAutoRefresh: true });
   }, seconds * 1000);
   setStatus(`Live auto-refresh enabled every ${seconds}s (runs in-play only).`);
 }
@@ -1591,21 +1741,54 @@ function renderResult(payload) {
   updateVersionCallouts();
 }
 
-async function runSimulation(fromAutoRefresh = false) {
-  if (state.simulationInFlight || ui.simulateButton.disabled) {
+async function runSimulation(options = {}) {
+  const fromAutoRefresh = Boolean(options.fromAutoRefresh);
+  const targetTour = normalizedTourValue(options.targetTour || ui.tourSelect.value);
+  const activeTour = normalizedTourValue(ui.tourSelect.value);
+  const targetEventId = String(
+    options.targetEventId != null ? options.targetEventId : (targetTour === activeTour ? ui.eventSelect.value : "")
+  ).trim();
+  const background = Boolean(options.background || targetTour !== activeTour);
+  if (targetTour === activeTour && !targetEventId && !hasSimulatableEvents()) {
+    setTourTabSimulationState(targetTour, "idle");
+    setStatus(
+      `No simulatable event currently available for ${targetTour.toUpperCase()}. Waiting for DataGolf current-week feed update.`
+    );
     return;
   }
+
+  if (state.simulationInFlight || ui.simulateButton.disabled) {
+    queueSimulationRequest({
+      tour: targetTour,
+      eventId: targetEventId,
+      fromAutoRefresh,
+    });
+    if (!fromAutoRefresh && targetTour === activeTour) {
+      setStatus(`Simulation queued for ${targetTour.toUpperCase()}.`, true);
+    }
+    return;
+  }
+
   state.simulationInFlight = true;
-  setError();
-  setFormStatus("Loading seasonal form data...", true);
-  if (fromAutoRefresh) {
-    setSimulationAutomationStatus("Simulation automation: running scheduled simulation...", true);
+  state.currentSimulationTour = targetTour;
+  setTourTabSimulationState(targetTour, "running");
+  if (!background) {
+    setError();
+    setFormStatus("Loading seasonal form data...", true);
+    if (fromAutoRefresh) {
+      setSimulationAutomationStatus("Simulation automation: running scheduled simulation...", true);
+    }
+    setStatus(
+      fromAutoRefresh ? "Running auto-refresh simulation..." : "Running simulation...",
+      true
+    );
+  } else {
+    setSimulationAutomationStatus(
+      `Simulation queue: running ${targetTour.toUpperCase()}...`,
+      true
+    );
   }
   setBusy(true);
-  setStatus(
-    fromAutoRefresh ? "Running auto-refresh simulation..." : "Running simulation...",
-    true
-  );
 
   try {
     const simulations = Number.parseInt(ui.simulationsInput.value, 10) || 10000;
@@ -1629,8 +1812,8 @@ async function runSimulation(fromAutoRefresh = false) {
     const seedRaw = ui.seedInput.value.trim();
 
     const requestBody = {
-      tour: ui.tourSelect.value,
-      event_id: ui.eventSelect.value || null,
+      tour: targetTour,
+      event_id: targetEventId || null,
       resolution_mode: ui.resolutionModeSelect.value || "fixed_cap",
       simulations: simulations,
       min_simulations: minSimulations,
@@ -1689,8 +1872,12 @@ async function runSimulation(fromAutoRefresh = false) {
     }
 
     const payload = await response.json();
-    renderResult(payload);
-    await loadEventTrendsForCurrentEvent({ silent: true });
+    const shouldRenderNow = targetTour === normalizedTourValue(ui.tourSelect.value);
+    if (shouldRenderNow) {
+      renderResult(payload);
+      await loadEventTrendsForCurrentEvent({ silent: true });
+    }
+    setTourTabSimulationState(targetTour, "complete");
     const statusBits = [];
     if (payload.stop_reason) {
       statusBits.push(`stop=${payload.stop_reason}`);
@@ -1716,33 +1903,40 @@ async function runSimulation(fromAutoRefresh = false) {
     if (payload.simulation_version != null) {
       statusBits.push(`snapshot=v${Number(payload.simulation_version)}`);
     }
-    setStatus(statusBits.length > 0 ? `Simulation complete. ${statusBits.join(" | ")}` : "Simulation complete.");
-    if (fromAutoRefresh) {
-      setSimulationAutomationStatus(
-        `Simulation automation: last run ${new Date().toLocaleTimeString()} | next run in ${AUTOMATION_SIMULATION_INTERVAL_SECONDS}s.`
-      );
+    if (shouldRenderNow) {
+      setStatus(statusBits.length > 0 ? `Simulation complete. ${statusBits.join(" | ")}` : "Simulation complete.");
+      if (fromAutoRefresh) {
+        setSimulationAutomationStatus(
+          `Simulation automation: last run ${new Date().toLocaleTimeString()} | next run in ${AUTOMATION_SIMULATION_INTERVAL_SECONDS}s.`
+        );
+      }
+      void loadLearningStatus(true);
+      void loadLifecycleStatus(true);
     }
-    void loadLearningStatus(true);
-    void loadLifecycleStatus(true);
   } catch (error) {
-    setStatus("Simulation failed.");
-    if (fromAutoRefresh) {
-      setSimulationAutomationStatus(
-        "Simulation automation: latest scheduled run failed (see error).",
-        false
-      );
+    setTourTabSimulationState(targetTour, "failed");
+    if (targetTour === normalizedTourValue(ui.tourSelect.value)) {
+      setStatus("Simulation failed.");
+      if (fromAutoRefresh) {
+        setSimulationAutomationStatus(
+          "Simulation automation: latest scheduled run failed (see error).",
+          false
+        );
+      }
+      setError(error.message || "Unexpected error while running the simulation.");
     }
-    setError(error.message || "Unexpected error while running the simulation.");
   } finally {
     setBusy(false);
     state.simulationInFlight = false;
+    state.currentSimulationTour = null;
+    processNextQueuedSimulation();
   }
 }
 
 function bindEvents() {
   ui.loadEventsButton.addEventListener("click", loadEvents);
   ui.simulateButton.addEventListener("click", () => {
-    void runSimulation(false);
+    void runSimulation({ fromAutoRefresh: false });
   });
   if (ui.syncLearningButton) {
     ui.syncLearningButton.addEventListener("click", syncLearningAndRetrain);
@@ -1753,11 +1947,31 @@ function bindEvents() {
   if (ui.runLifecycleButton) {
     ui.runLifecycleButton.addEventListener("click", runLifecycleNow);
   }
+  if (ui.tourTabs) {
+    ui.tourTabs.addEventListener("click", (event) => {
+      const tab = event.target instanceof Element ? event.target.closest(".tour-tab[data-tour]") : null;
+      if (!tab) {
+        return;
+      }
+      const selectedTour = normalizedTourValue(tab.getAttribute("data-tour"));
+      if (selectedTour === normalizedTourValue(ui.tourSelect.value)) {
+        return;
+      }
+      ui.tourSelect.value = selectedTour;
+      ui.tourSelect.dispatchEvent(new Event("change"));
+    });
+  }
   ui.tourSelect.addEventListener("change", () => {
+    renderTourTabs();
     resetEventTrends();
+    const selectedTour = normalizedTourValue(ui.tourSelect.value);
+    const allowAutoSimulate = shouldAutoSimulateForTour(selectedTour);
     void loadEvents().then(() => {
       startAutoSimulation();
-      void loadLatestSnapshotFromDb({ silent: true });
+      void loadLatestSnapshotFromDb({
+        silent: true,
+        runIfMissing: allowAutoSimulate,
+      });
     });
     void loadLearningStatus(true);
     void loadLifecycleStatus(true);
@@ -1765,7 +1979,10 @@ function bindEvents() {
   if (ui.eventSelect) {
     ui.eventSelect.addEventListener("change", () => {
       resetEventTrends();
-      void loadLatestSnapshotFromDb({ silent: true });
+      void loadLatestSnapshotFromDb({
+        silent: true,
+        runIfMissing: shouldAutoSimulateForTour(ui.tourSelect.value),
+      });
     });
   }
   if (ui.liveAutoRefreshSelect) {
@@ -1833,10 +2050,18 @@ function init() {
   ui.seasonalWeightValue.textContent = Number.parseFloat(ui.seasonalWeightInput.value).toFixed(2);
   ui.currentSeasonWeightValue.textContent = Number.parseFloat(ui.currentSeasonWeightInput.value).toFixed(2);
   ui.formDeltaWeightValue.textContent = Number.parseFloat(ui.formDeltaWeightInput.value).toFixed(2);
+  SUPPORTED_TOURS.forEach((tour) => {
+    state.tabSimulationStateByTour[tour.value] = "idle";
+  });
+  renderTourTabs();
   updateVersionCallouts();
+  const defaultTour = normalizedTourValue(ui.tourSelect.value);
   void loadEvents().then(() => {
     startAutoSimulation();
-    void loadLatestSnapshotFromDb({ silent: true });
+    void loadLatestSnapshotFromDb({
+      silent: true,
+      runIfMissing: shouldAutoSimulateForTour(defaultTour),
+    });
   });
   loadLearningStatus(true);
   loadLifecycleStatus(true);
