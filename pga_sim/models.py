@@ -224,3 +224,69 @@ class LifecycleStatusResponse(BaseModel):
     last_run_at: Optional[datetime] = None
     last_run_note: Optional[str] = None
     recent_events: list[LifecycleEventStatus] = Field(default_factory=list)
+
+
+class PowerRankingEvent(BaseModel):
+    event_id: str
+    event_name: Optional[str] = None
+    event_year: int
+    event_date: Optional[str] = None
+    source_snapshot_type: Optional[str] = None
+    source_simulation_version: Optional[int] = None
+    outcomes_available: bool = False
+
+
+class PowerRankingPoint(BaseModel):
+    event_id: str
+    event_name: Optional[str] = None
+    event_year: int
+    event_date: Optional[str] = None
+    rank: Optional[int] = None
+    score: Optional[float] = None
+    event_score: Optional[float] = None
+
+
+class PowerRankingPlayerSeries(BaseModel):
+    player_id: Optional[str] = None
+    player_name: str
+    latest_rank: Optional[int] = None
+    latest_score: Optional[float] = None
+    points: list[PowerRankingPoint] = Field(default_factory=list)
+
+
+class PowerRankingsResponse(BaseModel):
+    generated_at: datetime
+    tour: str
+    event_year: int
+    lookback_events: int
+    top_n: int
+    events: list[PowerRankingEvent] = Field(default_factory=list)
+    players: list[PowerRankingPlayerSeries] = Field(default_factory=list)
+    note: Optional[str] = None
+
+
+class PowerRankingWarmStartRequest(BaseModel):
+    tours: list[str] = Field(default_factory=lambda: ["pga", "liv", "euro", "kft"])
+    event_year: Optional[int] = Field(default=None, ge=1990, le=2100)
+    simulations: int = Field(default=100_000, ge=500, le=2_000_000)
+    force: bool = Field(default=False)
+
+
+class PowerRankingWarmStartTourResult(BaseModel):
+    tour: str
+    status: str
+    event_id: Optional[str] = None
+    event_name: Optional[str] = None
+    event_year: Optional[int] = None
+    simulation_version: Optional[int] = None
+    simulations: Optional[int] = None
+    note: Optional[str] = None
+
+
+class PowerRankingWarmStartResponse(BaseModel):
+    generated_at: datetime
+    event_year: int
+    simulations: int
+    force: bool = False
+    results: list[PowerRankingWarmStartTourResult] = Field(default_factory=list)
+    note: Optional[str] = None

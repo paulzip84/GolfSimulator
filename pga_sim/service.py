@@ -21,6 +21,12 @@ from .models import (
     LearningEventTrendsResponse,
     LearningStatusResponse,
     LearningSyncResponse,
+    PowerRankingEvent,
+    PowerRankingPlayerSeries,
+    PowerRankingPoint,
+    PowerRankingsResponse,
+    PowerRankingWarmStartResponse,
+    PowerRankingWarmStartTourResult,
     PlayerSimulationOutput,
     SimulationRequest,
     SimulationResponse,
@@ -136,6 +142,7 @@ _HOLE_SCORE_FLAT_KEYS = tuple(
     + [f"hole_{idx}" for idx in range(1, 19)]
 )
 _LIFECYCLE_COMPLETED_STATES = {"complete", "outcomes_synced", "awaiting_official", "retrained"}
+_REPORT_WARM_START_TOURS = ("pga", "liv", "euro", "kft")
 
 
 @dataclass
@@ -594,6 +601,7 @@ class SimulationService:
 
         selected_event_id = _normalized_event_id(request.event_id)
         selected_event_name: str | None = None
+        selected_event_date: str | None = None
         if selected_event_id:
             get_schedule = getattr(self._datagolf, "get_schedule", None)
             if callable(get_schedule):
@@ -619,6 +627,7 @@ class SimulationService:
                         )
                         if row_event_id == selected_event_id:
                             selected_event_name = _string_from_keys(row, _EVENT_NAME_KEYS)
+                            selected_event_date = _string_from_keys(row, _DATE_KEYS)
                             break
 
         active_event_id = _normalized_event_id(_string_from_payload(field_payload, _EVENT_ID_KEYS))
@@ -667,8 +676,21 @@ class SimulationService:
         event_date = (
             _string_from_payload(field_payload, _DATE_KEYS)
             or _string_from_payload(pre_payload, _DATE_KEYS)
+            or selected_event_date
         )
         season_phase = _season_phase_from_date(event_date)
+        record_event_date = event_date
+        if not record_event_date:
+            fallback_year = (
+                request.current_season
+                if request.current_season is not None
+                else self._lifecycle_target_year
+            )
+            fallback_year_int = int(fallback_year)
+            record_event_date = f"{fallback_year_int:04d}-01-01"
+            data_feed_warnings.append(
+                "event date unavailable; used season-year fallback for snapshot storage scope"
+            )
 
         field_rows = _extract_rows(field_payload, ("field", "player"))
         live_rows = _extract_rows(live_payload, ("in-play", "player", "pred"))
@@ -917,7 +939,7 @@ class SimulationService:
             raw_top_3_probability=raw_top_3_probability,
             raw_top_5_probability=raw_top_5_probability,
             raw_top_10_probability=raw_top_10_probability,
-            event_date=event_date,
+            event_date=record_event_date,
             in_play_applied=in_play_context.applied,
         )
         if recorded_version > 0:
@@ -966,6 +988,479 @@ class SimulationService:
             max_players=max_players,
         )
         return LearningEventTrendsResponse(**payload)
+
+    async def get_power_rankings_report(
+        self,
+        *,
+        tour: str = "pga",
+        lookback_events: int = 12,
+        top_n: int = 12,
+        event_year: int | None = None,
+    ) -> PowerRankingsResponse:
+        if self._learning is None:
+            raise ValueError("Learning store is not configured.")
+
+        normalized_tour = (tour or "pga").strip().lower()
+        resolved_event_year = int(
+            event_year if event_year is not None else self._lifecycle_target_year
+        )
+        lookback = max(3, min(int(lookback_events), 60))
+        top_limit = max(1, min(int(top_n), 40))
+
+        event_inputs = self._learning.list_power_ranking_event_inputs(
+            tour=normalized_tour,
+            event_year=resolved_event_year,
+            max_events=lookback,
+        )
+        if not event_inputs:
+            raise LookupError(
+                f"No stored simulation history available for {normalized_tour.upper()} in {resolved_event_year}."
+            )
+
+        smoothing_alpha = 0.58
+        absence_decay = 0.985
+        power_by_key: dict[str, float] = {}
+        player_meta_by_key: dict[str, dict[str, str | None]] = {}
+        snapshot_rows: list[dict[str, Any]] = []
+
+        for event in event_inputs:
+            event_player_scores: dict[str, float] = {}
+            event_outcomes = {
+                str(row.get("player_key")): row for row in (event.get("outcomes") or [])
+            }
+            seen_keys: set[str] = set()
+
+            for player in event.get("players") or []:
+                player_key = str(player.get("player_key") or "").strip()
+                if not player_key:
+                    continue
+                seen_keys.add(player_key)
+                if player_key not in player_meta_by_key:
+                    player_meta_by_key[player_key] = {
+                        "player_id": _to_str(player.get("player_id")),
+                        "player_name": _to_str(player.get("player_name")) or player_key,
+                    }
+
+                sim_score = _power_ranking_sim_score(
+                    win_probability=_to_float(player.get("win_probability")) or 0.0,
+                    top_3_probability=_to_float(player.get("top_3_probability")) or 0.0,
+                    top_5_probability=_to_float(player.get("top_5_probability")) or 0.0,
+                    top_10_probability=_to_float(player.get("top_10_probability")) or 0.0,
+                )
+                outcome_row = event_outcomes.get(player_key)
+                event_score = sim_score
+                finish_rank = _to_int(
+                    outcome_row.get("finish_rank") if outcome_row is not None else None
+                )
+                if finish_rank is not None and finish_rank > 0:
+                    finish_bonus = max(0.0, 26.0 - min(float(finish_rank), 26.0))
+                    event_score = sim_score + finish_bonus
+
+                previous_power = power_by_key.get(player_key)
+                if previous_power is None:
+                    updated_power = event_score
+                else:
+                    updated_power = (
+                        (1.0 - smoothing_alpha) * previous_power
+                        + (smoothing_alpha * event_score)
+                    )
+                power_by_key[player_key] = float(updated_power)
+                event_player_scores[player_key] = float(event_score)
+
+            missing_keys = [key for key in power_by_key.keys() if key not in seen_keys]
+            for missing_key in missing_keys:
+                power_by_key[missing_key] = float(power_by_key[missing_key] * absence_decay)
+
+            ordered_power = sorted(
+                power_by_key.items(),
+                key=lambda item: (
+                    -item[1],
+                    _normalized_name(
+                        (player_meta_by_key.get(item[0]) or {}).get("player_name") or item[0]
+                    ),
+                ),
+            )
+            rank_by_key = {key: idx + 1 for idx, (key, _) in enumerate(ordered_power)}
+            score_by_key = {key: float(score) for key, score in ordered_power}
+            snapshot_rows.append(
+                {
+                    "event_id": str(event["event_id"]),
+                    "event_name": _to_str(event.get("event_name")),
+                    "event_year": int(event["event_year"]),
+                    "event_date": _to_str(event.get("event_date")),
+                    "rank_by_key": rank_by_key,
+                    "score_by_key": score_by_key,
+                    "event_score_by_key": event_player_scores,
+                }
+            )
+
+        if not snapshot_rows:
+            raise LookupError(
+                f"No power ranking snapshots available for {normalized_tour.upper()} in {resolved_event_year}."
+            )
+
+        latest_snapshot = snapshot_rows[-1]
+        latest_ordered = sorted(
+            latest_snapshot["score_by_key"].items(),
+            key=lambda item: -item[1],
+        )
+        selected_player_keys = [key for key, _ in latest_ordered[:top_limit]]
+
+        player_series: list[PowerRankingPlayerSeries] = []
+        for player_key in selected_player_keys:
+            player_meta = player_meta_by_key.get(player_key, {})
+            points: list[PowerRankingPoint] = []
+            for snapshot in snapshot_rows:
+                points.append(
+                    PowerRankingPoint(
+                        event_id=snapshot["event_id"],
+                        event_name=snapshot["event_name"],
+                        event_year=snapshot["event_year"],
+                        event_date=snapshot["event_date"],
+                        rank=snapshot["rank_by_key"].get(player_key),
+                        score=snapshot["score_by_key"].get(player_key),
+                        event_score=snapshot["event_score_by_key"].get(player_key),
+                    )
+                )
+            player_series.append(
+                PowerRankingPlayerSeries(
+                    player_id=player_meta.get("player_id"),
+                    player_name=(player_meta.get("player_name") or player_key),
+                    latest_rank=latest_snapshot["rank_by_key"].get(player_key),
+                    latest_score=latest_snapshot["score_by_key"].get(player_key),
+                    points=points,
+                )
+            )
+
+        player_series.sort(
+            key=lambda row: (
+                row.latest_rank if row.latest_rank is not None else 10_000,
+                _normalized_name(row.player_name),
+            )
+        )
+
+        events = [
+            PowerRankingEvent(
+                event_id=str(event.get("event_id") or ""),
+                event_name=_to_str(event.get("event_name")),
+                event_year=int(event.get("event_year") or resolved_event_year),
+                event_date=_to_str(event.get("event_date")),
+                source_snapshot_type=_to_str(event.get("snapshot_type")),
+                source_simulation_version=_to_int(event.get("simulation_version")),
+                outcomes_available=bool(event.get("outcomes")),
+            )
+            for event in event_inputs
+        ]
+
+        note = (
+            "Power score blends simulation probabilities with exponential smoothing across "
+            "events and adds a small finish-rank bonus for resolved outcomes."
+        )
+        return PowerRankingsResponse(
+            generated_at=datetime.now(timezone.utc),
+            tour=normalized_tour,
+            event_year=resolved_event_year,
+            lookback_events=lookback,
+            top_n=top_limit,
+            events=events,
+            players=player_series,
+            note=note,
+        )
+
+    async def warm_start_power_rankings(
+        self,
+        *,
+        tours: list[str] | None = None,
+        event_year: int | None = None,
+        simulations: int = 100_000,
+        force: bool = False,
+    ) -> PowerRankingWarmStartResponse:
+        if self._learning is None:
+            raise ValueError("Learning store is not configured.")
+
+        resolved_event_year = int(
+            event_year if event_year is not None else self._lifecycle_target_year
+        )
+        requested_tours = _normalize_report_warm_start_tours(tours)
+        resolved_simulations = max(
+            500, min(int(simulations), self._simulation_max_sync_simulations)
+        )
+
+        results: list[PowerRankingWarmStartTourResult] = []
+        simulated_count = 0
+        skipped_count = 0
+        failed_count = 0
+
+        for tour_code in requested_tours:
+            existing = self._learning.list_power_ranking_event_inputs(
+                tour=tour_code,
+                event_year=resolved_event_year,
+                max_events=1,
+            )
+            if existing and not force:
+                latest = existing[-1]
+                results.append(
+                    PowerRankingWarmStartTourResult(
+                        tour=tour_code,
+                        status="skipped_existing",
+                        event_id=_to_str(latest.get("event_id")),
+                        event_name=_to_str(latest.get("event_name")),
+                        event_year=_to_int(latest.get("event_year")) or resolved_event_year,
+                        simulation_version=_to_int(latest.get("simulation_version")),
+                        note="History already exists for this tour/year.",
+                    )
+                )
+                skipped_count += 1
+                continue
+
+            selected_event_id: str | None = None
+            schedule_note: str | None = None
+            try:
+                upcoming_events = await self.list_upcoming_events(tour=tour_code, limit=40)
+                simulatable = next(
+                    (event for event in upcoming_events if event.simulatable),
+                    None,
+                )
+                if simulatable is not None:
+                    selected_event_id = simulatable.event_id
+                elif upcoming_events:
+                    schedule_note = (
+                        "No simulatable event in schedule; using feed-default event."
+                    )
+                else:
+                    schedule_note = (
+                        "No schedule rows available; using feed-default event."
+                    )
+            except Exception as exc:
+                schedule_note = (
+                    f"Event lookup unavailable ({exc}); using feed-default event."
+                )
+
+            simulation_result: SimulationResponse | None = None
+            try:
+                simulation_result = await self._run_report_warm_start_simulation(
+                    tour=tour_code,
+                    event_id=selected_event_id,
+                    event_year=resolved_event_year,
+                    simulations=resolved_simulations,
+                )
+            except Exception as exc:
+                if selected_event_id is not None:
+                    try:
+                        simulation_result = await self._run_report_warm_start_simulation(
+                            tour=tour_code,
+                            event_id=None,
+                            event_year=resolved_event_year,
+                            simulations=resolved_simulations,
+                        )
+                        fallback_note = (
+                            "Selected event was unavailable; used feed-default event."
+                        )
+                        schedule_note = (
+                            f"{schedule_note} {fallback_note}".strip()
+                            if schedule_note
+                            else fallback_note
+                        )
+                    except Exception as fallback_exc:
+                        results.append(
+                            PowerRankingWarmStartTourResult(
+                                tour=tour_code,
+                                status="failed",
+                                note=str(fallback_exc),
+                            )
+                        )
+                        failed_count += 1
+                        continue
+                else:
+                    results.append(
+                        PowerRankingWarmStartTourResult(
+                            tour=tour_code,
+                            status="failed",
+                            note=str(exc),
+                        )
+                    )
+                    failed_count += 1
+                    continue
+
+            if simulation_result is None:
+                results.append(
+                    PowerRankingWarmStartTourResult(
+                        tour=tour_code,
+                        status="failed",
+                        note="Unknown warm-start failure.",
+                    )
+                )
+                failed_count += 1
+                continue
+
+            seeded_history = self._learning.list_power_ranking_event_inputs(
+                tour=tour_code,
+                event_year=resolved_event_year,
+                max_events=1,
+            )
+            latest_seeded = seeded_history[-1] if seeded_history else None
+            if latest_seeded is None:
+                seeded_note = self._seed_power_ranking_report_snapshot(
+                    tour=tour_code,
+                    event_year=resolved_event_year,
+                    selected_event_id=selected_event_id,
+                    simulation_result=simulation_result,
+                )
+                seeded_history = self._learning.list_power_ranking_event_inputs(
+                    tour=tour_code,
+                    event_year=resolved_event_year,
+                    max_events=1,
+                )
+                latest_seeded = seeded_history[-1] if seeded_history else None
+            else:
+                seeded_note = None
+
+            if latest_seeded is None:
+                results.append(
+                    PowerRankingWarmStartTourResult(
+                        tour=tour_code,
+                        status="failed",
+                        note=(
+                            "Simulation completed but no year-scoped snapshot was persisted "
+                            f"for {resolved_event_year}."
+                        ),
+                    )
+                )
+                failed_count += 1
+                continue
+
+            note_parts: list[str] = []
+            if schedule_note:
+                note_parts.append(schedule_note)
+            if simulation_result.stop_reason:
+                note_parts.append(f"stop={simulation_result.stop_reason}")
+            if simulation_result.in_play_conditioning_note:
+                note_parts.append(simulation_result.in_play_conditioning_note)
+            if seeded_note:
+                note_parts.append(seeded_note)
+
+            results.append(
+                PowerRankingWarmStartTourResult(
+                    tour=tour_code,
+                    status="simulated",
+                    event_id=_to_str(latest_seeded.get("event_id")) or simulation_result.event_id,
+                    event_name=(
+                        _to_str(latest_seeded.get("event_name"))
+                        or simulation_result.event_name
+                    ),
+                    event_year=resolved_event_year,
+                    simulation_version=(
+                        _to_int(latest_seeded.get("simulation_version"))
+                        or simulation_result.simulation_version
+                    ),
+                    simulations=simulation_result.simulations,
+                    note=" | ".join(note_parts) if note_parts else None,
+                )
+            )
+            simulated_count += 1
+
+        note = (
+            "Warm-start complete: "
+            f"simulated={simulated_count}, skipped={skipped_count}, failed={failed_count}."
+        )
+        return PowerRankingWarmStartResponse(
+            generated_at=datetime.now(timezone.utc),
+            event_year=resolved_event_year,
+            simulations=resolved_simulations,
+            force=bool(force),
+            results=results,
+            note=note,
+        )
+
+    async def _run_report_warm_start_simulation(
+        self,
+        *,
+        tour: str,
+        event_id: str | None,
+        event_year: int,
+        simulations: int,
+    ) -> SimulationResponse:
+        resolved_simulations = max(
+            500, min(int(simulations), self._simulation_max_sync_simulations)
+        )
+        request = SimulationRequest(
+            tour=tour,
+            event_id=event_id,
+            resolution_mode="fixed_cap",
+            simulations=resolved_simulations,
+            min_simulations=min(250_000, resolved_simulations),
+            simulation_batch_size=min(
+                self._simulation_max_batch_size,
+                resolved_simulations,
+            ),
+            enable_adaptive_simulation=False,
+            enable_in_play_conditioning=False,
+            enable_seasonal_form=False,
+            current_season=int(event_year),
+            baseline_season=int(event_year) - 1,
+            snapshot_type="manual",
+        )
+        return await self.simulate(request)
+
+    def _seed_power_ranking_report_snapshot(
+        self,
+        *,
+        tour: str,
+        event_year: int,
+        selected_event_id: str | None,
+        simulation_result: SimulationResponse,
+    ) -> str | None:
+        if self._learning is None:
+            return None
+        players = list(simulation_result.players or [])
+        if not players:
+            return None
+
+        resolved_event_name = (
+            _to_str(simulation_result.event_name)
+            or _to_str(selected_event_id)
+            or f"{tour.upper()} Warm Start"
+        )
+        resolved_event_id = (
+            _normalized_event_id(_to_str(simulation_result.event_id))
+            or _normalized_event_id(_to_str(selected_event_id))
+            or _synthetic_event_id_from_name(resolved_event_name, event_year=event_year)
+        )
+        if not resolved_event_id:
+            return None
+
+        player_rows: list[dict[str, Any]] = []
+        for row in players:
+            player_rows.append(
+                {
+                    "player_id": row.player_id,
+                    "player_name": row.player_name,
+                    "win_probability": float(row.win_probability),
+                    "top_3_probability": float(row.top_3_probability),
+                    "top_5_probability": float(row.top_5_probability),
+                    "top_10_probability": float(row.top_10_probability),
+                }
+            )
+
+        if not player_rows:
+            return None
+
+        self._learning.record_prediction(
+            tour=tour,
+            event_id=resolved_event_id,
+            event_name=resolved_event_name,
+            event_date=f"{int(event_year):04d}-01-01",
+            requested_simulations=simulation_result.requested_simulations
+            or simulation_result.simulations,
+            simulations=simulation_result.simulations,
+            enable_in_play=False,
+            in_play_applied=False,
+            snapshot_type="manual",
+            players=player_rows,
+        )
+        if _to_str(simulation_result.event_id):
+            return None
+        return f"Seeded report snapshot with synthetic event_id={resolved_event_id}."
 
     async def get_latest_snapshot(
         self,
@@ -3154,6 +3649,24 @@ def _event_names_compatible(selected_name: str | None, feed_name: str | None) ->
     return bool(selected_tokens & feed_tokens)
 
 
+def _power_ranking_sim_score(
+    *,
+    win_probability: float,
+    top_3_probability: float,
+    top_5_probability: float,
+    top_10_probability: float,
+) -> float:
+    return float(
+        100.0
+        * (
+            (0.67 * np.clip(win_probability, 0.0, 1.0))
+            + (0.18 * np.clip(top_3_probability, 0.0, 1.0))
+            + (0.10 * np.clip(top_5_probability, 0.0, 1.0))
+            + (0.05 * np.clip(top_10_probability, 0.0, 1.0))
+        )
+    )
+
+
 def _normalize_tour_code(value: str | None) -> str | None:
     if value is None:
         return None
@@ -3189,6 +3702,38 @@ def _requested_tour_code_set(tour: str | None) -> set[str]:
     if normalized:
         return {normalized}
     return {"pga"}
+
+
+def _normalize_report_warm_start_tours(tours: list[str] | None) -> list[str]:
+    requested = tours if tours is not None else list(_REPORT_WARM_START_TOURS)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in requested:
+        normalized_value = _normalize_tour_code(value)
+        if normalized_value is None:
+            continue
+        if normalized_value == "alt":
+            normalized_value = "liv"
+        if normalized_value not in _REPORT_WARM_START_TOURS:
+            continue
+        if normalized_value in seen:
+            continue
+        seen.add(normalized_value)
+        normalized.append(normalized_value)
+    if not normalized:
+        return list(_REPORT_WARM_START_TOURS)
+    return normalized
+
+
+def _synthetic_event_id_from_name(event_name: str, *, event_year: int) -> str:
+    normalized = _normalized_event_name(event_name)
+    if not normalized:
+        return f"warm-{int(event_year)}"
+    slug = "-".join(normalized.split())
+    slug = slug[:42].strip("-")
+    if not slug:
+        slug = "event"
+    return f"warm-{int(event_year)}-{slug}"
 
 
 def _season_from_row(row: dict[str, Any]) -> int | None:
@@ -4541,6 +5086,15 @@ def _to_float(value: Any) -> float | None:
         return None
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
 

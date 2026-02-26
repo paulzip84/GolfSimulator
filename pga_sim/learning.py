@@ -868,6 +868,165 @@ class LearningStore:
             )
         return out
 
+    def list_power_ranking_event_inputs(
+        self,
+        *,
+        tour: str = "pga",
+        event_year: int | None = None,
+        max_events: int = 16,
+    ) -> list[dict[str, Any]]:
+        normalized_tour = self._normalize_tour(tour)
+        with self._lock, self._connect() as conn:
+            event_rows = conn.execute(
+                """
+                SELECT
+                  event_id,
+                  event_year,
+                  MAX(event_name) AS event_name,
+                  MAX(event_date) AS event_date
+                FROM simulation_runs
+                WHERE tour = ?
+                  AND event_id IS NOT NULL
+                  AND event_year IS NOT NULL
+                  AND (? IS NULL OR event_year = ?)
+                GROUP BY event_id, event_year
+                ORDER BY
+                  CASE
+                    WHEN MAX(event_date) IS NULL OR trim(MAX(event_date)) = '' THEN 1
+                    ELSE 0
+                  END,
+                  MAX(event_date) ASC,
+                  event_year ASC,
+                  event_id ASC
+                """,
+                (
+                    normalized_tour,
+                    event_year,
+                    event_year,
+                ),
+            ).fetchall()
+
+            events: list[dict[str, Any]] = []
+            for row in event_rows:
+                event_id = _normalize_token(row["event_id"])
+                if not event_id:
+                    continue
+                year_value = int(row["event_year"])
+                run_row = conn.execute(
+                    """
+                    SELECT
+                      run_id,
+                      created_at,
+                      simulation_version,
+                      snapshot_type,
+                      event_name,
+                      event_date
+                    FROM simulation_runs
+                    WHERE tour = ?
+                      AND event_id = ?
+                      AND event_year = ?
+                    ORDER BY
+                      CASE
+                        WHEN snapshot_type = 'pre_event' THEN 2
+                        WHEN snapshot_type = 'manual' THEN 1
+                        ELSE 0
+                      END DESC,
+                      simulation_version DESC,
+                      created_at DESC
+                    LIMIT 1
+                    """,
+                    (normalized_tour, event_id, year_value),
+                ).fetchone()
+                if run_row is None:
+                    continue
+
+                player_rows = conn.execute(
+                    """
+                    SELECT
+                      player_key,
+                      player_id,
+                      player_name,
+                      win_prob,
+                      top3_prob,
+                      top5_prob,
+                      top10_prob
+                    FROM simulation_players
+                    WHERE run_id = ?
+                    """,
+                    (str(run_row["run_id"]),),
+                ).fetchall()
+                if not player_rows:
+                    continue
+
+                outcome_rows = conn.execute(
+                    """
+                    SELECT
+                      player_key,
+                      finish_rank,
+                      won,
+                      top3,
+                      top5,
+                      top10
+                    FROM event_outcomes
+                    WHERE tour = ?
+                      AND event_id = ?
+                      AND event_year = ?
+                    """,
+                    (normalized_tour, event_id, year_value),
+                ).fetchall()
+
+                events.append(
+                    {
+                        "event_id": event_id,
+                        "event_year": year_value,
+                        "event_name": (
+                            run_row["event_name"]
+                            if run_row["event_name"] is not None
+                            else row["event_name"]
+                        ),
+                        "event_date": (
+                            run_row["event_date"]
+                            if run_row["event_date"] is not None
+                            else row["event_date"]
+                        ),
+                        "run_id": str(run_row["run_id"]),
+                        "created_at": _parse_iso_datetime(run_row["created_at"]),
+                        "simulation_version": int(run_row["simulation_version"] or 1),
+                        "snapshot_type": _normalize_snapshot_type(run_row["snapshot_type"]),
+                        "players": [
+                            {
+                                "player_key": str(player_row["player_key"]),
+                                "player_id": player_row["player_id"],
+                                "player_name": player_row["player_name"],
+                                "win_probability": float(player_row["win_prob"]),
+                                "top_3_probability": float(player_row["top3_prob"]),
+                                "top_5_probability": float(player_row["top5_prob"]),
+                                "top_10_probability": float(player_row["top10_prob"]),
+                            }
+                            for player_row in player_rows
+                        ],
+                        "outcomes": [
+                            {
+                                "player_key": str(outcome_row["player_key"]),
+                                "finish_rank": (
+                                    int(outcome_row["finish_rank"])
+                                    if outcome_row["finish_rank"] is not None
+                                    else None
+                                ),
+                                "won": bool(int(outcome_row["won"])),
+                                "top_3": bool(int(outcome_row["top3"])),
+                                "top_5": bool(int(outcome_row["top5"])),
+                                "top_10": bool(int(outcome_row["top10"])),
+                            }
+                            for outcome_row in outcome_rows
+                        ],
+                    }
+                )
+
+        if max_events > 0 and len(events) > int(max_events):
+            return events[-int(max_events):]
+        return events
+
     def list_pending_events(
         self,
         *,

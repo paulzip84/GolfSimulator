@@ -24,6 +24,9 @@ from .models import (
     LearningStatusResponse,
     LearningSyncRequest,
     LearningSyncResponse,
+    PowerRankingsResponse,
+    PowerRankingWarmStartRequest,
+    PowerRankingWarmStartResponse,
     SimulationRequest,
     SimulationResponse,
 )
@@ -206,6 +209,47 @@ async def learning_event_trends(
             max_snapshots=max_snapshots,
             max_players=max_players,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/reports/power-rankings", response_model=PowerRankingsResponse)
+async def reports_power_rankings(
+    tour: str = Query(default="pga"),
+    lookback_events: int = Query(default=12, ge=3, le=60),
+    top_n: int = Query(default=12, ge=5, le=40),
+    event_year: Optional[int] = Query(default=None, ge=1990, le=2100),
+) -> PowerRankingsResponse:
+    try:
+        return await _service.get_power_rankings_report(
+            tour=tour,
+            lookback_events=lookback_events,
+            top_n=top_n,
+            event_year=event_year,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post(
+    "/reports/power-rankings/warm-start",
+    response_model=PowerRankingWarmStartResponse,
+)
+async def reports_power_rankings_warm_start(
+    request: PowerRankingWarmStartRequest,
+    _: None = Depends(require_learning_admin),
+) -> PowerRankingWarmStartResponse:
+    try:
+        return await _service.warm_start_power_rankings(
+            tours=request.tours,
+            event_year=request.event_year,
+            simulations=request.simulations,
+            force=request.force,
+        )
+    except DataGolfAPIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

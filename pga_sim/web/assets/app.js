@@ -22,6 +22,7 @@ const state = {
   simulationQueue: [],
   tabSimulationStateByTour: {},
   eventsRequestToken: 0,
+  powerRankingReport: null,
 };
 const AUTOMATION_SIMULATION_INTERVAL_SECONDS = 120;
 const LIVE_SCORE_POLL_INTERVAL_SECONDS = 30;
@@ -227,6 +228,14 @@ const CONTROL_TOOLTIPS = {
     "Reload learning stats without retraining.",
   runLifecycleButton:
     "Run one lifecycle automation cycle now (pre-event snapshot + outcome sync/retrain checks).",
+  powerLookbackInput:
+    "Number of recent events to include in power ranking trend history.",
+  powerTopNInput:
+    "Number of ranked players to plot and show in the power ranking report.",
+  refreshPowerReportButton:
+    "Refresh the power ranking report for the selected tour.",
+  warmStartPowerReportButton:
+    "Seed missing snapshot history for all tours so power-ranking reports can render immediately.",
 };
 
 const ui = {
@@ -267,6 +276,13 @@ const ui = {
   refreshLearningButton: document.getElementById("refreshLearningButton"),
   runLifecycleButton: document.getElementById("runLifecycleButton"),
   applyRecommendationButton: document.getElementById("applyRecommendationButton"),
+  powerLookbackInput: document.getElementById("powerLookbackInput"),
+  powerTopNInput: document.getElementById("powerTopNInput"),
+  refreshPowerReportButton: document.getElementById("refreshPowerReportButton"),
+  warmStartPowerReportButton: document.getElementById("warmStartPowerReportButton"),
+  powerRankingStatus: document.getElementById("powerRankingStatus"),
+  powerRankingChart: document.getElementById("powerRankingChart"),
+  powerRankingTableBody: document.getElementById("powerRankingTableBody"),
   status: document.getElementById("status"),
   formStatus: document.getElementById("formStatus"),
   learningStatus: document.getElementById("learningStatus"),
@@ -336,6 +352,15 @@ function setLifecycleStatus(message = "", running = false) {
   ui.lifecycleStatus.textContent = message;
   ui.lifecycleStatus.classList.toggle("running", running);
   ui.lifecycleStatus.classList.toggle("idle", !running);
+}
+
+function setPowerRankingStatus(message = "", running = false) {
+  if (!ui.powerRankingStatus) {
+    return;
+  }
+  ui.powerRankingStatus.textContent = message;
+  ui.powerRankingStatus.classList.toggle("running", running);
+  ui.powerRankingStatus.classList.toggle("idle", !running);
 }
 
 function normalizedTourValue(value) {
@@ -445,6 +470,12 @@ function setBusy(isBusy) {
   }
   if (ui.applyRecommendationButton) {
     ui.applyRecommendationButton.disabled = isBusy;
+  }
+  if (ui.refreshPowerReportButton) {
+    ui.refreshPowerReportButton.disabled = isBusy;
+  }
+  if (ui.warmStartPowerReportButton) {
+    ui.warmStartPowerReportButton.disabled = isBusy;
   }
 }
 
@@ -787,6 +818,409 @@ function renderLifecycleHistory(events) {
     });
     ui.lifecycleHistoryBody.appendChild(tr);
   });
+}
+
+function formatPowerScore(value) {
+  if (value == null || Number.isNaN(Number(value))) {
+    return "-";
+  }
+  return Number(value).toFixed(2);
+}
+
+function compactEventLabel(eventName, eventDate) {
+  const name = String(eventName || "").trim();
+  if (!name) {
+    return String(eventDate || "-");
+  }
+  if (name.length <= 18) {
+    return name;
+  }
+  return `${name.slice(0, 17)}…`;
+}
+
+function clearPowerRankingReport(message = "No power ranking data available yet.") {
+  state.powerRankingReport = null;
+  if (ui.powerRankingChart) {
+    ui.powerRankingChart.innerHTML = "";
+    const empty = document.createElement("div");
+    empty.className = "bump-chart-empty";
+    empty.textContent = message;
+    ui.powerRankingChart.appendChild(empty);
+  }
+  if (ui.powerRankingTableBody) {
+    ui.powerRankingTableBody.innerHTML = "";
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 5;
+    td.textContent = message;
+    tr.appendChild(td);
+    ui.powerRankingTableBody.appendChild(tr);
+  }
+}
+
+function renderPowerRankingTable(payload) {
+  if (!ui.powerRankingTableBody) {
+    return;
+  }
+  ui.powerRankingTableBody.innerHTML = "";
+  const players = Array.isArray(payload?.players) ? payload.players : [];
+  if (players.length === 0) {
+    clearPowerRankingReport("No ranking rows to display.");
+    return;
+  }
+  players.forEach((player) => {
+    const tr = document.createElement("tr");
+    const latestPoint = Array.isArray(player.points) && player.points.length > 0
+      ? player.points[player.points.length - 1]
+      : null;
+    const cells = [
+      player.latest_rank != null ? String(player.latest_rank) : "-",
+      player.player_name || "-",
+      formatPowerScore(player.latest_score),
+      latestPoint?.event_name || latestPoint?.event_id || "-",
+      latestPoint?.rank != null ? String(latestPoint.rank) : "-",
+    ];
+    cells.forEach((value, idx) => {
+      const td = document.createElement("td");
+      td.textContent = value;
+      if (idx === 0 || idx === 2 || idx === 4) {
+        td.className = "num";
+      }
+      tr.appendChild(td);
+    });
+    ui.powerRankingTableBody.appendChild(tr);
+  });
+}
+
+function renderPowerRankingChart(payload) {
+  if (!ui.powerRankingChart) {
+    return;
+  }
+  ui.powerRankingChart.innerHTML = "";
+  if (typeof window.d3 === "undefined") {
+    clearPowerRankingReport("D3 did not load; unable to render bump chart.");
+    return;
+  }
+  const d3 = window.d3;
+  const events = Array.isArray(payload?.events) ? payload.events : [];
+  const players = Array.isArray(payload?.players) ? payload.players : [];
+  if (events.length < 2 || players.length === 0) {
+    clearPowerRankingReport("Need at least two events and one player to draw bump chart.");
+    return;
+  }
+
+  const eventKey = (event) => `${event.event_id}:${event.event_year}`;
+  const eventKeys = events.map((event) => eventKey(event));
+  const eventByKey = {};
+  events.forEach((event) => {
+    eventByKey[eventKey(event)] = event;
+  });
+
+  const orderedSeries = players.map((player) => {
+    const pointByKey = {};
+    (Array.isArray(player.points) ? player.points : []).forEach((point) => {
+      pointByKey[`${point.event_id}:${point.event_year}`] = point;
+    });
+    return {
+      player_name: player.player_name || "-",
+      latest_rank: player.latest_rank,
+      latest_score: player.latest_score,
+      points: eventKeys.map((key) => {
+        const point = pointByKey[key] || null;
+        return {
+          event_key: key,
+          rank: point && point.rank != null ? Number(point.rank) : null,
+          score: point && point.score != null ? Number(point.score) : null,
+          event_score: point && point.event_score != null ? Number(point.event_score) : null,
+        };
+      }),
+    };
+  });
+
+  const chartWidth = Math.max(760, ui.powerRankingChart.clientWidth || 760);
+  const margin = { top: 24, right: 30, bottom: 56, left: 52 };
+  const maxPointRank = orderedSeries.reduce((acc, row) => {
+    const rowMax = row.points.reduce((rowAcc, point) => {
+      const rank = Number(point.rank);
+      return Number.isFinite(rank) ? Math.max(rowAcc, rank) : rowAcc;
+    }, 0);
+    return Math.max(acc, rowMax);
+  }, 0);
+  const maxRank = Math.max(
+    maxPointRank,
+    orderedSeries.reduce(
+      (acc, row) => Math.max(acc, Number.isFinite(Number(row.latest_rank)) ? Number(row.latest_rank) : 0),
+      0
+    ),
+    orderedSeries.length,
+    Number(payload?.top_n || 10)
+  );
+  const chartHeight = Math.max(420, 160 + (maxRank * 24));
+
+  const xScale = d3.scalePoint(eventKeys, [margin.left, chartWidth - margin.right]).padding(0.45);
+  const yScale = d3.scaleLinear([1, maxRank], [margin.top, chartHeight - margin.bottom]);
+  const line = d3
+    .line()
+    .defined((point) => point.rank != null && Number.isFinite(point.rank))
+    .x((point) => xScale(point.event_key))
+    .y((point) => yScale(point.rank))
+    .curve(d3.curveMonotoneX);
+
+  const colorPalette = [
+    ...(d3.schemeTableau10 || []),
+    ...(d3.schemeSet3 || []),
+    ...(d3.schemePaired || []),
+  ];
+  const colorScale = d3
+    .scaleOrdinal()
+    .domain(orderedSeries.map((row) => row.player_name))
+    .range(colorPalette.length > 0 ? colorPalette : ["#0c7a70"]);
+
+  const svg = d3
+    .select(ui.powerRankingChart)
+    .append("svg")
+    .attr("viewBox", `0 0 ${chartWidth} ${chartHeight}`)
+    .attr("role", "img")
+    .attr("aria-label", "Power ranking bump chart");
+
+  const yTickStep = maxRank <= 12 ? 1 : maxRank <= 25 ? 2 : 5;
+  const yTicks = d3.range(1, maxRank + 1, yTickStep);
+  svg
+    .append("g")
+    .attr("class", "bump-grid")
+    .selectAll("line")
+    .data(yTicks)
+    .join("line")
+    .attr("x1", margin.left)
+    .attr("x2", chartWidth - margin.right)
+    .attr("y1", (rank) => yScale(rank))
+    .attr("y2", (rank) => yScale(rank));
+
+  const seriesGroup = svg.append("g").attr("class", "bump-series");
+  const tooltip = document.createElement("div");
+  tooltip.className = "bump-tooltip";
+  tooltip.hidden = true;
+  ui.powerRankingChart.appendChild(tooltip);
+
+  const hideTooltip = () => {
+    tooltip.hidden = true;
+  };
+  const showTooltip = (event, payloadRow, point) => {
+    const meta = eventByKey[point.event_key] || {};
+    const scoreText = point.score != null ? point.score.toFixed(2) : "-";
+    const eventScoreText = point.event_score != null ? point.event_score.toFixed(2) : "-";
+    tooltip.innerHTML = [
+      `<strong>${payloadRow.player_name}</strong>`,
+      `${meta.event_name || meta.event_id || point.event_key}`,
+      `Rank: ${point.rank != null ? point.rank : "-"}`,
+      `Power: ${scoreText}`,
+      `Event Score: ${eventScoreText}`,
+    ].join("<br />");
+    const bounds = ui.powerRankingChart.getBoundingClientRect();
+    const left = event.clientX - bounds.left + 12;
+    const top = event.clientY - bounds.top + 12;
+    tooltip.style.left = `${left}px`;
+    tooltip.style.top = `${top}px`;
+    tooltip.hidden = false;
+  };
+
+  const lines = seriesGroup
+    .selectAll("path")
+    .data(orderedSeries)
+    .join("path")
+    .attr("class", "bump-line")
+    .attr("d", (row) => line(row.points))
+    .attr("stroke", (row) => colorScale(row.player_name))
+    .on("mouseenter", function onEnter(_, row) {
+      lines.classed("is-highlighted", false);
+      d3.select(this).classed("is-highlighted", true);
+      const lastPoint = row.points.find((point) => point.rank != null) || row.points[0];
+      if (lastPoint) {
+        showTooltip({ clientX: margin.left, clientY: margin.top }, row, lastPoint);
+      }
+    })
+    .on("mouseleave", function onLeave() {
+      d3.select(this).classed("is-highlighted", false);
+      hideTooltip();
+    });
+
+  const dotRows = orderedSeries.flatMap((row) =>
+    row.points
+      .filter((point) => point.rank != null && Number.isFinite(point.rank))
+      .map((point) => ({
+        player_name: row.player_name,
+        point,
+      }))
+  );
+  seriesGroup
+    .selectAll("circle")
+    .data(dotRows)
+    .join("circle")
+    .attr("class", "bump-dot")
+    .attr("cx", (row) => xScale(row.point.event_key))
+    .attr("cy", (row) => yScale(row.point.rank))
+    .attr("r", 3.4)
+    .attr("fill", (row) => colorScale(row.player_name))
+    .on("mousemove", (event, row) => {
+      showTooltip(event, { player_name: row.player_name }, row.point);
+    })
+    .on("mouseleave", hideTooltip);
+
+  const xAxis = d3
+    .axisBottom(xScale)
+    .tickFormat((key) => {
+      const event = eventByKey[key] || {};
+      return compactEventLabel(event.event_name, event.event_date);
+    });
+  svg
+    .append("g")
+    .attr("class", "bump-axis")
+    .attr("transform", `translate(0, ${chartHeight - margin.bottom})`)
+    .call(xAxis)
+    .selectAll("text")
+    .attr("transform", "translate(0,8) rotate(-22)")
+    .style("text-anchor", "end");
+
+  svg
+    .append("g")
+    .attr("class", "bump-axis")
+    .attr("transform", `translate(${margin.left},0)`)
+    .call(d3.axisLeft(yScale).tickValues(yTicks).tickFormat((value) => value));
+
+  const legend = document.createElement("div");
+  legend.className = "bump-legend";
+  orderedSeries.forEach((row) => {
+    const item = document.createElement("span");
+    item.className = "bump-legend-item";
+    item.style.borderColor = colorScale(row.player_name);
+    item.textContent = `#${row.latest_rank ?? "-"} ${row.player_name}`;
+    legend.appendChild(item);
+  });
+  ui.powerRankingChart.appendChild(legend);
+}
+
+function renderPowerRankingReport(payload) {
+  renderPowerRankingChart(payload);
+  renderPowerRankingTable(payload);
+}
+
+async function loadPowerRankingReport(silent = false) {
+  if (!ui.powerRankingStatus) {
+    return;
+  }
+  const lookback = Math.max(3, Math.min(60, Number.parseInt(ui.powerLookbackInput?.value || "12", 10) || 12));
+  const topN = Math.max(5, Math.min(40, Number.parseInt(ui.powerTopNInput?.value || "12", 10) || 12));
+  if (!silent) {
+    setPowerRankingStatus("Loading power rankings...", true);
+  }
+  try {
+    const tour = encodeURIComponent(ui.tourSelect.value);
+    const response = await fetch(
+      `/reports/power-rankings?tour=${tour}&lookback_events=${lookback}&top_n=${topN}`
+    );
+    if (response.status === 404) {
+      let detail = "No power ranking history available yet for this tour.";
+      try {
+        const errPayload = await response.json();
+        if (errPayload?.detail) {
+          detail = String(errPayload.detail);
+        }
+      } catch (_) {
+        // Keep default detail when body is not JSON.
+      }
+      clearPowerRankingReport(detail);
+      setPowerRankingStatus(detail, false);
+      return;
+    }
+    if (!response.ok) {
+      let detail = `Unable to load power rankings (${response.status})`;
+      try {
+        const errPayload = await response.json();
+        if (errPayload?.detail) {
+          detail = String(errPayload.detail);
+        }
+      } catch (_) {
+        // Keep default detail when body is not JSON.
+      }
+      throw new Error(detail);
+    }
+
+    const payload = await response.json();
+    state.powerRankingReport = payload;
+    renderPowerRankingReport(payload);
+    setPowerRankingStatus(
+      `Power rankings loaded: ${payload.players.length} players across ${payload.events.length} events (${String(payload.tour || ui.tourSelect.value).toUpperCase()}).`
+    );
+  } catch (error) {
+    clearPowerRankingReport("Unable to load power ranking report.");
+    setPowerRankingStatus("Unable to load power rankings.", false);
+    if (!silent) {
+      setError(error.message || "Unexpected error while loading power rankings.");
+    }
+  }
+}
+
+async function warmStartPowerRankingReports() {
+  setError();
+  setBusy(true);
+  setPowerRankingStatus("Running warm-start snapshots for all tours...", true);
+
+  try {
+    const simulationsRaw = Number.parseInt(ui.simulationsInput?.value || "100000", 10) || 100000;
+    const eventYear = Number.parseInt(ui.currentSeasonInput?.value || "", 10);
+    const requestBody = {
+      tours: SUPPORTED_TOURS.map((entry) => entry.value),
+      simulations: Math.max(500, Math.min(250000, simulationsRaw)),
+      force: false,
+    };
+    if (!Number.isNaN(eventYear)) {
+      requestBody.event_year = eventYear;
+    }
+
+    const response = await fetch("/reports/power-rankings/warm-start", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!response.ok) {
+      let detail = `Warm-start failed (${response.status})`;
+      try {
+        const errPayload = await response.json();
+        if (errPayload?.detail) {
+          detail = String(errPayload.detail);
+        }
+      } catch (_) {
+        // Keep default detail when body is not JSON.
+      }
+      throw new Error(detail);
+    }
+
+    const payload = await response.json();
+    const rows = Array.isArray(payload?.results) ? payload.results : [];
+    const simulated = rows.filter((row) => String(row?.status || "") === "simulated");
+    const skipped = rows.filter((row) => String(row?.status || "") === "skipped_existing");
+    const failed = rows.filter((row) => String(row?.status || "") === "failed");
+
+    const failedTours = failed
+      .map((row) => String(row?.tour || "").toUpperCase())
+      .filter((value) => value.length > 0);
+
+    const summary = `Warm-start complete: simulated=${simulated.length}, skipped=${skipped.length}, failed=${failed.length}.`;
+    setStatus(summary);
+    if (failedTours.length > 0) {
+      setError(`Warm-start failures: ${failedTours.join(", ")}. Check status text for details.`);
+    }
+
+    await loadPowerRankingReport(false);
+  } catch (error) {
+    setPowerRankingStatus("Warm-start failed.", false);
+    setError(error.message || "Unexpected error while warm-starting reports.");
+  } finally {
+    setBusy(false);
+  }
 }
 
 function playerRowKey(player, index) {
@@ -1225,6 +1659,7 @@ async function syncLearningAndRetrain() {
     }
     setStatus(`Learning sync complete. ${statusParts.join(" | ")}`);
     void loadLifecycleStatus(true);
+    void loadPowerRankingReport(true);
   } catch (error) {
     setStatus("Learning sync/retrain failed.");
     setError(error.message || "Unexpected error during learning retrain.");
@@ -1478,6 +1913,7 @@ async function loadLatestSnapshotFromDb({ silent = true, runIfMissing = true } =
     setStatus(
       `Loaded latest snapshot from DB: v${Number(payload.simulation_version || 1)} (${Number(payload.simulations || 0).toLocaleString()} sims).`
     );
+    void loadPowerRankingReport(true);
   } catch (error) {
     setTourTabSimulationState(tourValue, "failed");
     if (!silent) {
@@ -1912,6 +2348,7 @@ async function runSimulation(options = {}) {
       }
       void loadLearningStatus(true);
       void loadLifecycleStatus(true);
+      void loadPowerRankingReport(true);
     }
   } catch (error) {
     setTourTabSimulationState(targetTour, "failed");
@@ -1947,6 +2384,26 @@ function bindEvents() {
   if (ui.runLifecycleButton) {
     ui.runLifecycleButton.addEventListener("click", runLifecycleNow);
   }
+  if (ui.refreshPowerReportButton) {
+    ui.refreshPowerReportButton.addEventListener("click", () => {
+      void loadPowerRankingReport(false);
+    });
+  }
+  if (ui.warmStartPowerReportButton) {
+    ui.warmStartPowerReportButton.addEventListener("click", () => {
+      void warmStartPowerRankingReports();
+    });
+  }
+  if (ui.powerLookbackInput) {
+    ui.powerLookbackInput.addEventListener("change", () => {
+      void loadPowerRankingReport(false);
+    });
+  }
+  if (ui.powerTopNInput) {
+    ui.powerTopNInput.addEventListener("change", () => {
+      void loadPowerRankingReport(false);
+    });
+  }
   if (ui.tourTabs) {
     ui.tourTabs.addEventListener("click", (event) => {
       const tab = event.target instanceof Element ? event.target.closest(".tour-tab[data-tour]") : null;
@@ -1975,6 +2432,7 @@ function bindEvents() {
     });
     void loadLearningStatus(true);
     void loadLifecycleStatus(true);
+    void loadPowerRankingReport(true);
   });
   if (ui.eventSelect) {
     ui.eventSelect.addEventListener("change", () => {
@@ -2065,6 +2523,7 @@ function init() {
   });
   loadLearningStatus(true);
   loadLifecycleStatus(true);
+  loadPowerRankingReport(true);
   applyAutoRefreshSchedule();
   startLifecyclePoll();
   startLiveScorePoll();

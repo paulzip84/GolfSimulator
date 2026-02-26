@@ -348,6 +348,50 @@
         </div>
       </section>
 
+      <section id="reportSection" class="card reports">
+        <div class="report-head">
+          <div>
+            <p class="eyebrow">Reporting</p>
+            <h2>Tour Power Rankings</h2>
+            <p class="report-subhead">
+              Bump-chart trend of player rank movement by event using stored simulation snapshots and resolved outcomes.
+            </p>
+          </div>
+          <div class="report-controls">
+            <label class="field">
+              <span>Lookback Events</span>
+              <input id="powerLookbackInput" type="number" min="3" max="60" value="12" />
+            </label>
+            <label class="field">
+              <span>Players</span>
+              <input id="powerTopNInput" type="number" min="5" max="40" value="12" />
+            </label>
+            <button id="refreshPowerReportButton" class="btn btn-secondary" type="button">
+              Refresh Report
+            </button>
+            <button id="warmStartPowerReportButton" class="btn btn-secondary" type="button">
+              Warm-Start Reports
+            </button>
+          </div>
+        </div>
+        <p id="powerRankingStatus" class="status idle">Loading power rankings...</p>
+        <div id="powerRankingChart" class="bump-chart-wrap" aria-label="Power ranking bump chart"></div>
+        <div class="table-wrap power-ranking-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Rank</th>
+                <th>Player</th>
+                <th>Power Score</th>
+                <th>Last Event</th>
+                <th>Last Event Rank</th>
+              </tr>
+            </thead>
+            <tbody id="powerRankingTableBody"></tbody>
+          </table>
+        </div>
+      </section>
+
       <footer class="feedback-row">
         <a
           class="feedback-link"
@@ -358,6 +402,7 @@
       </footer>
     </main>
 
+    <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
     <script src="/assets/app.js"></script>
   </body>
 </html>
